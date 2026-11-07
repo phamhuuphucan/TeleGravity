@@ -1,10 +1,22 @@
 # 🚀 TeleGravity — Antigravity Telegram Bridge (`agy acp`)
 
-> **Điều khiển Google Antigravity từ xa 24/7 qua Telegram** — Đồng bộ trực tiếp phiên làm việc 2 chiều với ứng dụng Antigravity trên máy tính (macOS / Windows / Linux) hoặc vận hành độc lập trên Cloud VPS, **không cần API Key**.
+🌐 **Ngôn ngữ / Languages**: **🇻🇳 Tiếng Việt** · [🇬🇧 English](docs/i18n/README.en.md) · [🇫🇷 Français](docs/i18n/README.fr.md) · [🇯🇵 日本語](docs/i18n/README.ja.md) · [🇰🇷 한국어](docs/i18n/README.ko.md) · [🇨🇳 中文](docs/i18n/README.zh.md) · [🇷🇺 Русский](docs/i18n/README.ru.md) · [🇩🇪 Deutsch](docs/i18n/README.de.md) · [🇪🇸 Español](docs/i18n/README.es.md)
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20VPS-success.svg)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+## 🌍 Mô Tả Dự Án (Multilingual Description)
+
+- 🇻🇳 **Tiếng Việt**: **Điều khiển Google Antigravity từ xa 24/7 qua Telegram** — Đồng bộ trực tiếp phiên làm việc 2 chiều với ứng dụng Antigravity trên máy tính (macOS / Windows / Linux) hoặc vận hành độc lập trên Cloud VPS, **không cần API Key**.
+- 🇬🇧 **English**: **Control Google Antigravity remotely 24/7 via Telegram** — Seamlessly sync sessions two-way with the Antigravity Desktop App (macOS / Windows / Linux) or run standalone on a Cloud VPS, **with no API Key required**. ([Read full English guide →](docs/i18n/README.en.md))
+- 🇫🇷 **Français**: **Contrôlez Google Antigravity à distance 24h/24 et 7j/7 via Telegram** — Synchronisation bidirectionnelle transparente des sessions avec l'application de bureau Antigravity (macOS / Windows / Linux) ou exécution autonome sur un VPS Cloud, **sans clé API requise**. ([Lire le guide en français →](docs/i18n/README.fr.md))
+- 🇯🇵 **日本語**: **Telegram から 24時間365日 Google Antigravity をリモート操作** — デスクトップ版 Antigravity アプリ（macOS / Windows / Linux）との双方向セッション同期、およびクラウド VPS での24時間稼働に対応。**API キーは不要です。** ([日本語ガイドを読む →](docs/i18n/README.ja.md))
+- 🇰🇷 **한국어**: **텔레그램을 통해 연중무휴 24시간 Google Antigravity를 원격 제어하세요** — 데스크톱 Antigravity 앱(macOS / Windows / Linux)과 실시간 양방향 세션 동기화를 지원하며, 클라우드 VPS에서도 **별도의 API 키 없이** 24시간 구동할 수 있습니다. ([한국어 가이드 보기 →](docs/i18n/README.ko.md))
+- 🇨🇳 **中文**: **通过 Telegram 全天候 24/7 远程控制 Google Antigravity** — 与桌面端 Antigravity 应用（macOS / Windows / Linux）无缝双向同步会话，或独立部署在云端 VPS 上，**无需任何 API Key**。([阅读中文指南 →](docs/i18n/README.zh.md))
+- 🇷🇺 **Русский**: **Удаленное управление Google Antigravity 24/7 через Telegram** — Двусторонняя синхронизация сессий с настольным приложением Antigravity (macOS / Windows / Linux) или автономная работа на облачном VPS **без необходимости использования API-ключа**. ([Читать руководство на русском →](docs/i18n/README.ru.md))
+- 🇩🇪 **Deutsch**: **Steuern Sie Google Antigravity 24/7 aus der Ferne über Telegram** — Nahtlose bidirektionale Sitzungssynchronisierung mit der Antigravity Desktop-App (macOS / Windows / Linux) oder eigenständiger Betrieb auf einem Cloud-VPS, **ganz ohne API-Schlüssel**. ([Deutsche Anleitung lesen →](docs/i18n/README.de.md))
+- 🇪🇸 **Español**: **Controla Google Antigravity de forma remota 24/7 a través de Telegram** — Sincronización bidireccional de sesiones con la aplicación de escritorio Antigravity (macOS / Windows / Linux) o ejecución independiente en un VPS en la nube, **sin necesidad de clave API**. ([Leer guía en español →](docs/i18n/README.es.md))
 
 ---
 
