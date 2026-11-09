@@ -24,6 +24,7 @@ Tài liệu này tổng hợp toàn bộ các lệnh điều khiển trên Teleg
 | `/model` | `/model`<br/>`/model <model_id>` | Nếu không truyền tham số: liệt kê các model hiện có trong tài khoản của bạn. Nếu truyền `model_id`: chuyển ngay sang model đó. |
 | `/mode` | `/mode default`<br/>`/mode accept-edits`<br/>`/mode plan` | Thay đổi chế độ kiểm duyệt của Agent (xem chi tiết ở Mục 2 bên dưới). |
 | `/auto` | `/auto on`<br/>`/auto off` | Bật hoặc tắt chế độ tự động chấp thuận mọi yêu cầu quyền hạn của Agent mà không cần hỏi lại trên Telegram. |
+| `/restart` | `/restart` | Lưu trạng thái phiên hiện tại và khởi động lại tiến trình Bot ngay từ Telegram. |
 
 ### Nhóm lệnh Giao việc & Slash Commands của Antigravity
 - **Tin nhắn văn bản thông thường**: Gửi trực tiếp yêu cầu lập trình, sửa lỗi, giải thích code...

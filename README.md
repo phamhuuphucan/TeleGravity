@@ -110,6 +110,7 @@ Toàn bộ quy trình từ thiết lập trên máy cá nhân, đồng bộ phi�
 | `/model [id]` | Xem danh sách model khả dụng hoặc đổi model (Gemini, Claude...) |
 | `/mode [default\|accept-edits\|plan]` | Chuyển đổi chế độ kiểm duyệt thao tác của Agent |
 | `/auto [on\|off]` | Bật / tắt chế độ tự động duyệt mọi yêu cầu (Auto-approve) |
+| `/restart` | Khởi động lại tiến trình Bot từ xa ngay trên Telegram |
 | `/goal ...`, `/plan ...`, `/browser ...` | Chuyển tiếp trực tiếp các Slash Command của Antigravity cho Agent |
 
 ---

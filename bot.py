@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import time
 import urllib.parse
 import uuid
@@ -81,7 +82,8 @@ ALLOWED_USER_IDS = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
 AGY_PATH = _resolve_agy_path()
-DEFAULT_WORKSPACE = os.path.expanduser(os.getenv("DEFAULT_WORKSPACE", "~"))
+_DEFAULT_WS_FALLBACK = "~/AN_Projects" if os.path.isdir(os.path.expanduser("~/AN_Projects")) else "~"
+DEFAULT_WORKSPACE = os.path.expanduser(os.getenv("DEFAULT_WORKSPACE", _DEFAULT_WS_FALLBACK))
 PROJECTS_ROOT = os.path.expanduser(os.getenv("PROJECTS_ROOT", DEFAULT_WORKSPACE))
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "").strip() or None
 DEFAULT_MODE = os.getenv("DEFAULT_MODE", "accept-edits").strip() or None
@@ -726,6 +728,9 @@ class Session:
                 text = ("❌ Agent đã dừng vì yêu cầu bị từ chối. Hãy nhắn hướng xử lý khác."
                         if c.get("rejected") else "<i>(Không có phản hồi văn bản)</i>")
             await send_long(self.app, chat_id, text)
+            if os.path.exists(__file__) and os.path.getmtime(__file__) != _BOT_START_MTIME:
+                log.info("Phát hiện bot.py thay đổi -> tự động nạp lại sau lượt chat")
+                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -764,6 +769,7 @@ def get_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Session:
 # ---------------------------------------------------------------------------
 # Định dạng Markdown -> Telegram HTML & Chia nhỏ tin nhắn thông minh
 # ---------------------------------------------------------------------------
+_BOT_START_MTIME = os.path.getmtime(__file__) if os.path.exists(__file__) else 0.0
 _RE_INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _RE_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 _RE_BOLD_ITALIC = re.compile(r"\*\*\*(.+?)\*\*\*")
@@ -777,6 +783,32 @@ _RE_HEADING_SUB = re.compile(r"^#{3,6}\s+(.+)$")
 _RE_UL_ITEM = re.compile(r"^(\s*)[-*+]\s+(.+)$")
 _RE_HR = re.compile(r"^\s*[-*_]{3,}\s*$")
 _RE_FENCE = re.compile(r"^\s*(`{3,}|~{3,})([\w+-]*)\s*$")
+_RE_TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]*$")
+_ALERT_LABELS = {
+    "NOTE": "ℹ️ **Lưu ý:** ",
+    "TIP": "💡 **Mẹo:** ",
+    "IMPORTANT": "❗ **Quan trọng:** ",
+    "WARNING": "⚠️ **Cảnh báo:** ",
+    "CAUTION": "🚨 **Thận trọng:** ",
+}
+
+
+def _split_table_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip().replace(r"\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _strip_outer_bold(s: str) -> str:
+    s = s.strip()
+    if (s.startswith("**") and s.endswith("**") and len(s) > 4) or (
+        s.startswith("__") and s.endswith("__") and len(s) > 4
+    ):
+        return s[2:-2].strip()
+    return s
 
 
 def _format_inline(line: str) -> str:
@@ -790,18 +822,20 @@ def _format_inline(line: str) -> str:
         return f"\x00CODE{idx}\x00"
 
     def _save_link(m: re.Match) -> str:
-        label, url = m.group(1), m.group(2)
+        label, url = m.group(1).strip(), m.group(2).strip()
+        # Escape các ký tự HTML bên ngoài placeholder CODE và khôi phục nội dung bên trong CODE
+        clean_label = re.sub(
+            r"\x00CODE(\d+)\x00",
+            lambda cm: codes[int(cm.group(1))][6:-7],
+            html.escape(label),
+        )
         idx = len(links)
         if url.startswith(("http://", "https://", "tg://")):
-            lbl_html = label if "\x00CODE" in label else html.escape(label)
-            links.append(f'<a href="{html.escape(url, quote=True)}">{lbl_html}</a>')
+            links.append(f'<a href="{html.escape(url, quote=True)}">{clean_label}</a>')
         else:
             # Telegram không cho phép giao thức file:// hoặc conversation:// trong thẻ <a>
             # -> Hiển thị tên file/symbol dạng monospace <code> gọn đẹp, thân thiện.
-            if "\x00CODE" in label:
-                links.append(label)
-            else:
-                links.append(f"<code>{html.escape(label)}</code>")
+            links.append(f"<code>{clean_label}</code>")
         return f"\x00LINK{idx}\x00"
 
     line = _RE_INLINE_CODE.sub(_save_code, line)
@@ -839,9 +873,50 @@ def md_to_tg_html(md_text: str) -> str:
             quote_buf.clear()
 
     def _flush_table() -> None:
-        if table_buf:
-            out.append("<pre>" + html.escape("\n".join(table_buf)) + "</pre>")
-            table_buf.clear()
+        if not table_buf:
+            return
+        parsed_rows = [
+            _split_table_row(t_line)
+            for t_line in table_buf
+            if not _RE_TABLE_SEP.match(t_line)
+        ]
+        table_buf.clear()
+        if not parsed_rows:
+            return
+        if len(parsed_rows) == 1:
+            out.append(" · ".join(_format_inline(c) for c in parsed_rows[0] if c))
+            return
+
+        headers = [_strip_outer_bold(h) for h in parsed_rows[0]]
+        data_rows = parsed_rows[1:]
+        for r in data_rows:
+            if not any(r):
+                continue
+            if len(headers) <= 2 and len(r) >= 2:
+                k = _format_inline(_strip_outer_bold(r[0]))
+                v = _format_inline(r[1])
+                if r[1] and r[1] not in ("—", "-"):
+                    out.append(f"• <b>{k}:</b> {v}")
+                else:
+                    out.append(f"• <b>{k}</b>")
+            else:
+                first_hdr = headers[0].lower() if headers else ""
+                if len(r) >= 2 and (first_hdr in ("#", "stt", "no", "no.") or r[0].isdigit()):
+                    title_html = f"{html.escape(r[0])}. {_format_inline(_strip_outer_bold(r[1]))}"
+                    start_col = 2
+                else:
+                    title_html = _format_inline(_strip_outer_bold(r[0]))
+                    start_col = 1
+                out.append(f"🔹 <b>{title_html}</b>")
+                for c_idx in range(start_col, len(r)):
+                    val = r[c_idx].strip()
+                    if not val or val in ("—", "-"):
+                        continue
+                    hdr = headers[c_idx] if c_idx < len(headers) else ""
+                    if hdr:
+                        out.append(f"  • <i>{_format_inline(hdr)}:</i> {_format_inline(val)}")
+                    else:
+                        out.append(f"  • {_format_inline(val)}")
 
     for raw_line in lines:
         m_fence = _RE_FENCE.match(raw_line)
@@ -881,8 +956,12 @@ def md_to_tg_html(md_text: str) -> str:
         # Blockquote (> ...)
         if stripped.startswith(">"):
             q_content = re.sub(r"^>\s?", "", stripped)
-            # Đổi nhãn GitHub Alert như [!NOTE], [!IMPORTANT] thành chữ đậm
-            q_content = re.sub(r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*", r"**[\1]** ", q_content)
+            # Đổi nhãn GitHub Alert như [!NOTE], [!IMPORTANT] sang icon tiếng Việt trực quan
+            q_content = re.sub(
+                r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*",
+                lambda m: _ALERT_LABELS.get(m.group(1), f"**[{m.group(1)}]** "),
+                q_content,
+            )
             quote_buf.append(_format_inline(q_content))
             continue
         else:
@@ -1041,7 +1120,8 @@ HELP = (
     "⚙️ <b>Cấu hình &amp; Quyền hạn:</b>\n"
     "• <code>/model [id]</code> – Xem hoặc đổi model AI\n"
     "• <code>/mode [default|accept-edits|plan]</code> – Chế độ duyệt\n"
-    "• <code>/auto [on|off]</code> – Tự động duyệt mọi yêu cầu\n\n"
+    "• <code>/auto [on|off]</code> – Tự động duyệt mọi yêu cầu\n"
+    "• <code>/restart</code> – Khởi động lại bot từ xa\n\n"
     "💡 <i>Các lệnh khác như <code>/goal</code>, <code>/plan</code>, <code>/browser</code> được chuyển thẳng cho Agent.</i>"
 )
 
@@ -1282,6 +1362,17 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    save_state()
+    await update.message.reply_text("🔄 <b>Đang khởi động lại bot…</b>", parse_mode=ParseMode.HTML)
+    for s in SESSIONS.values():
+        with contextlib.suppress(Exception):
+            await s.shutdown()
+    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+
+
 async def permission_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not authorized(update):
@@ -1335,6 +1426,7 @@ BOT_COMMANDS = [
     ("status", "Trạng thái"), ("new", "Hội thoại mới"), ("stop", "Huỷ tác vụ"),
     ("cd", "Đổi workspace"), ("projects", "Liệt kê dự án"), ("sessions", "Phiên gần đây"),
     ("model", "Xem/đổi model"), ("mode", "Chế độ duyệt"), ("auto", "Tự cho phép on/off"),
+    ("restart", "Khởi động lại bot"),
     ("goal", "Agent làm tới khi xong mục tiêu"), ("plan", "Lập kế hoạch trước"),
     ("help", "Trợ giúp"),
 ]
@@ -1381,6 +1473,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
+    app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_handler(CallbackQueryHandler(permission_cb, pattern=r"^p:"))
     app.add_handler(CallbackQueryHandler(resume_cb, pattern=r"^r:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
