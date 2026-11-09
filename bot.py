@@ -22,6 +22,7 @@ import html
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -688,14 +689,14 @@ class Session:
                     continue
                 c["dirty"] = False
                 steps = c["steps"]
-                lines = [f"⚙️ Đang làm việc ({int(time.monotonic() - started)}s)"]
+                lines = [f"⚙️ <b>Đang làm việc</b> (<code>{int(time.monotonic() - started)}s</code>)"]
                 if c["plan"]:
-                    lines += ["📋 Kế hoạch:"] + c["plan"][:10] + [""]
+                    lines += ["", "📋 <b>Kế hoạch:</b>"] + [html.escape(p) for p in c["plan"][:10]] + [""]
                 if len(steps) > 12:
-                    lines.append(f"… +{len(steps) - 12} bước trước")
-                lines += steps[-12:] or ["💭 Đang suy nghĩ…"]
+                    lines.append(f"<i>… +{len(steps) - 12} bước trước</i>")
+                lines += [html.escape(st) for st in steps[-12:]] or ["💭 <i>Đang suy nghĩ…</i>"]
                 with contextlib.suppress(BadRequest):
-                    await status.edit_text("\n".join(lines)[:MAX_TG_LEN])
+                    await status.edit_text("\n".join(lines)[:MAX_TG_LEN], parse_mode=ParseMode.HTML)
 
         progress = asyncio.create_task(progress_loop())
         try:
@@ -712,14 +713,18 @@ class Session:
             save_state()
             sync_antigravity_projects(self.session_id, self.workspace)
             elapsed = int(time.monotonic() - started)
-            icon = {"end_turn": "✅ Xong", "cancelled": "🛑 Đã huỷ", "refusal": "🚫 Từ chối"}.get(stop, f"⚠️ {stop}")
-            head = f"{icon} sau {elapsed}s · {len(c['steps'])} bước"
+            icon = {
+                "end_turn": "✅ <b>Hoàn tất</b>",
+                "cancelled": "🛑 <b>Đã huỷ</b>",
+                "refusal": "🚫 <b>Từ chối</b>",
+            }.get(stop, f"⚠️ <b>{html.escape(str(stop))}</b>")
+            head = f"{icon} sau <code>{elapsed}s</code> · <b>{len(c['steps'])}</b> bước"
             with contextlib.suppress(BadRequest):
-                await status.edit_text(head)
+                await status.edit_text(head, parse_mode=ParseMode.HTML)
             text = "".join(c["text"])
             if not text and stop == "end_turn":
                 text = ("❌ Agent đã dừng vì yêu cầu bị từ chối. Hãy nhắn hướng xử lý khác."
-                        if c.get("rejected") else "(Không có phản hồi văn bản)")
+                        if c.get("rejected") else "<i>(Không có phản hồi văn bản)</i>")
             await send_long(self.app, chat_id, text)
         except asyncio.CancelledError:
             raise
@@ -727,9 +732,12 @@ class Session:
             log.exception("Lượt chat lỗi")
             hint = ""
             if "auth" in str(e).lower() or "login" in str(e).lower():
-                hint = "\n👉 Chạy `agy` trong Terminal để đăng nhập lại Google."
+                hint = "\n👉 Chạy <code>./service.sh login</code> hoặc <code>agy</code> trong Terminal để đăng nhập lại Google."
             with contextlib.suppress(Exception):
-                await status.edit_text(f"❌ Lỗi: {e}{hint}"[:MAX_TG_LEN])
+                await status.edit_text(
+                    f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>{hint}"[:MAX_TG_LEN],
+                    parse_mode=ParseMode.HTML,
+                )
             if self.client and not self.client.alive:
                 self.client = None
         finally:
@@ -754,12 +762,243 @@ def get_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Session:
 
 
 # ---------------------------------------------------------------------------
+# Định dạng Markdown -> Telegram HTML & Chia nhỏ tin nhắn thông minh
+# ---------------------------------------------------------------------------
+_RE_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_RE_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+_RE_BOLD_ITALIC = re.compile(r"\*\*\*(.+?)\*\*\*")
+_RE_BOLD_AST = re.compile(r"\*\*(.+?)\*\*")
+_RE_BOLD_UND = re.compile(r"__(.+?)__")
+_RE_ITALIC_AST = re.compile(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)")
+_RE_ITALIC_UND = re.compile(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)")
+_RE_STRIKE = re.compile(r"~~(.+?)~~")
+_RE_HEADING_MAIN = re.compile(r"^#{1,2}\s+(.+)$")
+_RE_HEADING_SUB = re.compile(r"^#{3,6}\s+(.+)$")
+_RE_UL_ITEM = re.compile(r"^(\s*)[-*+]\s+(.+)$")
+_RE_HR = re.compile(r"^\s*[-*_]{3,}\s*$")
+_RE_FENCE = re.compile(r"^\s*(`{3,}|~{3,})([\w+-]*)\s*$")
+
+
+def _format_inline(line: str) -> str:
+    """Chuyển đổi các cú pháp inline Markdown sang Telegram HTML an toàn."""
+    codes: list[str] = []
+    links: list[str] = []
+
+    def _save_code(m: re.Match) -> str:
+        idx = len(codes)
+        codes.append(f"<code>{html.escape(m.group(1))}</code>")
+        return f"\x00CODE{idx}\x00"
+
+    def _save_link(m: re.Match) -> str:
+        label, url = m.group(1), m.group(2)
+        idx = len(links)
+        if url.startswith(("http://", "https://", "tg://")):
+            lbl_html = label if "\x00CODE" in label else html.escape(label)
+            links.append(f'<a href="{html.escape(url, quote=True)}">{lbl_html}</a>')
+        else:
+            # Telegram không cho phép giao thức file:// hoặc conversation:// trong thẻ <a>
+            # -> Hiển thị tên file/symbol dạng monospace <code> gọn đẹp, thân thiện.
+            if "\x00CODE" in label:
+                links.append(label)
+            else:
+                links.append(f"<code>{html.escape(label)}</code>")
+        return f"\x00LINK{idx}\x00"
+
+    line = _RE_INLINE_CODE.sub(_save_code, line)
+    line = _RE_MD_LINK.sub(_save_link, line)
+    line = html.escape(line)
+
+    line = _RE_BOLD_ITALIC.sub(r"<b><i>\1</i></b>", line)
+    line = _RE_BOLD_AST.sub(r"<b>\1</b>", line)
+    line = _RE_BOLD_UND.sub(r"<b>\1</b>", line)
+    line = _RE_ITALIC_AST.sub(r"<i>\1</i>", line)
+    line = _RE_ITALIC_UND.sub(r"<i>\1</i>", line)
+    line = _RE_STRIKE.sub(r"<s>\1</s>", line)
+
+    for idx, val in enumerate(links):
+        line = line.replace(f"\x00LINK{idx}\x00", val)
+    for idx, val in enumerate(codes):
+        line = line.replace(f"\x00CODE{idx}\x00", val)
+    return line
+
+
+def md_to_tg_html(md_text: str) -> str:
+    """Chuyển đổi văn bản Markdown của Agent sang chuẩn HTML của Telegram."""
+    lines = md_text.splitlines()
+    out: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    fence_lang = ""
+    code_buf: list[str] = []
+    quote_buf: list[str] = []
+    table_buf: list[str] = []
+
+    def _flush_quote() -> None:
+        if quote_buf:
+            out.append("<blockquote>" + "\n".join(quote_buf) + "</blockquote>")
+            quote_buf.clear()
+
+    def _flush_table() -> None:
+        if table_buf:
+            out.append("<pre>" + html.escape("\n".join(table_buf)) + "</pre>")
+            table_buf.clear()
+
+    for raw_line in lines:
+        m_fence = _RE_FENCE.match(raw_line)
+        if not in_fence and m_fence:
+            _flush_quote()
+            _flush_table()
+            in_fence = True
+            fence_marker = m_fence.group(1)[:3]
+            fence_lang = m_fence.group(2).strip()
+            code_buf.clear()
+            continue
+
+        if in_fence:
+            if raw_line.strip().startswith(fence_marker) and raw_line.strip().strip(fence_marker[0]) == "":
+                escaped_code = html.escape("\n".join(code_buf))
+                if fence_lang:
+                    out.append(f'<pre><code class="language-{html.escape(fence_lang)}">{escaped_code}</code></pre>')
+                else:
+                    out.append(f"<pre>{escaped_code}</pre>")
+                in_fence = False
+                fence_marker = ""
+                fence_lang = ""
+                code_buf.clear()
+            else:
+                code_buf.append(raw_line)
+            continue
+
+        # Bảng Markdown (dòng bắt đầu và kết thúc bằng |)
+        stripped = raw_line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and len(stripped) > 2:
+            _flush_quote()
+            table_buf.append(raw_line)
+            continue
+        else:
+            _flush_table()
+
+        # Blockquote (> ...)
+        if stripped.startswith(">"):
+            q_content = re.sub(r"^>\s?", "", stripped)
+            # Đổi nhãn GitHub Alert như [!NOTE], [!IMPORTANT] thành chữ đậm
+            q_content = re.sub(r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*", r"**[\1]** ", q_content)
+            quote_buf.append(_format_inline(q_content))
+            continue
+        else:
+            _flush_quote()
+
+        # Đường kẻ ngang
+        if _RE_HR.match(raw_line):
+            out.append("────────────────────")
+            continue
+
+        # Tiêu đề # / ## và ###..######
+        m_h1 = _RE_HEADING_MAIN.match(raw_line)
+        if m_h1:
+            out.append(f"\n📌 <b>{_format_inline(m_h1.group(1).strip())}</b>")
+            continue
+
+        m_h2 = _RE_HEADING_SUB.match(raw_line)
+        if m_h2:
+            out.append(f"\n🔹 <b>{_format_inline(m_h2.group(1).strip())}</b>")
+            continue
+
+        # Danh sách bullet (- / * / +)
+        m_ul = _RE_UL_ITEM.match(raw_line)
+        if m_ul:
+            indent, item_text = m_ul.group(1), m_ul.group(2)
+            out.append(f"{indent}• {_format_inline(item_text)}")
+            continue
+
+        out.append(_format_inline(raw_line))
+
+    if in_fence and code_buf:
+        escaped_code = html.escape("\n".join(code_buf))
+        out.append(f"<pre>{escaped_code}</pre>")
+    _flush_quote()
+    _flush_table()
+    return "\n".join(out).strip()
+
+
+def split_markdown_chunks(text: str, max_len: int = 3300) -> list[str]:
+    """Chia văn bản Markdown dài thành các đoạn an toàn, tự động đóng/mở lại code fence."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    cur_lines: list[str] = []
+    cur_len = 0
+    active_fence: str | None = None
+    fence_char = ""
+
+    for line in text.splitlines():
+        line_len = len(line) + 1
+        if cur_lines and cur_len + line_len > max_len:
+            if active_fence:
+                cur_lines.append(fence_char)
+                chunks.append("\n".join(cur_lines))
+                cur_lines = [active_fence]
+                cur_len = len(active_fence) + 1
+            else:
+                chunks.append("\n".join(cur_lines))
+                cur_lines = []
+                cur_len = 0
+
+        # Nếu 1 dòng đơn lẻ quá dài (vượt max_len)
+        while len(line) > max_len:
+            part = line[:max_len]
+            line = line[max_len:]
+            cur_lines.append(part)
+            if active_fence:
+                cur_lines.append(fence_char)
+                chunks.append("\n".join(cur_lines))
+                cur_lines = [active_fence]
+            else:
+                chunks.append("\n".join(cur_lines))
+                cur_lines = []
+            cur_len = sum(len(x) + 1 for x in cur_lines)
+
+        m_fence = _RE_FENCE.match(line)
+        if m_fence:
+            if active_fence is None:
+                fence_char = m_fence.group(1)[:3]
+                active_fence = line.strip()
+            elif line.strip().startswith(fence_char) and line.strip().strip(fence_char[0]) == "":
+                active_fence = None
+                fence_char = ""
+
+        cur_lines.append(line)
+        cur_len += line_len
+
+    if cur_lines:
+        if active_fence:
+            cur_lines.append(fence_char)
+        chunks.append("\n".join(cur_lines))
+    return chunks
+
+
+# ---------------------------------------------------------------------------
 # Tiện ích
 # ---------------------------------------------------------------------------
 async def send_long(app: Application, chat_id: int, text: str) -> None:
-    text = text.strip()
-    for i in range(0, len(text), MAX_TG_LEN):
-        await app.bot.send_message(chat_id, text[i : i + MAX_TG_LEN])
+    for md_chunk in split_markdown_chunks(text):
+        html_chunk = md_to_tg_html(md_chunk)
+        if not html_chunk:
+            continue
+        try:
+            await app.bot.send_message(
+                chat_id,
+                html_chunk[:MAX_TG_LEN],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            # Fallback an toàn nếu thẻ HTML vượt giới hạn hoặc có ký tự đặc biệt
+            await app.bot.send_message(chat_id, md_chunk[:MAX_TG_LEN])
 
 
 def authorized(update: Update) -> bool:
@@ -778,7 +1017,10 @@ def short_path(p: str) -> str:
 async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: list[dict]) -> None:
     s = get_session(context, update.effective_chat.id)
     if s.busy:
-        await update.message.reply_text("⏳ Agent đang bận. Gửi /stop để huỷ tác vụ hiện tại.")
+        await update.message.reply_text(
+            "⏳ <b>Agent đang bận.</b> Gửi <code>/stop</code> để huỷ tác vụ hiện tại.",
+            parse_mode=ParseMode.HTML,
+        )
         return
     s.task = context.application.create_task(s.run_turn(prompt))
 
@@ -788,27 +1030,33 @@ async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: lis
 # ---------------------------------------------------------------------------
 HELP = (
     "🤖 <b>Antigravity qua Telegram</b>\n"
-    "Gửi tin nhắn (hoặc ảnh kèm caption) để giao việc.\n\n"
-    "/status – trạng thái\n"
-    "/new – hội thoại mới\n"
-    "/stop – huỷ tác vụ đang chạy\n"
-    "/cd &lt;TenDuAn | /đường/dẫn&gt; – đổi workspace\n"
-    "/projects – liệt kê dự án\n"
-    "/sessions – các phiên gần đây (mở lại được)\n"
-    "/model [id] – xem/đổi model\n"
-    "/mode [default|accept-edits|plan] – chế độ duyệt\n"
-    "/auto on|off – tự cho phép mọi yêu cầu\n"
-    "Các lệnh khác (vd /goal, /plan, /browser) được chuyển cho agent."
+    "<i>Gửi tin nhắn văn bản hoặc ảnh kèm chú thích để giao việc cho Agent.</i>\n\n"
+    "📌 <b>Quản lý Phiên &amp; Dự án:</b>\n"
+    "• <code>/status</code> – Trạng thái hệ thống &amp; phiên hiện tại\n"
+    "• <code>/sessions</code> – Mở lại các phiên gần đây (App &amp; Telegram)\n"
+    "• <code>/projects</code> – Liệt kê danh sách dự án\n"
+    "• <code>/cd &lt;TênDựÁn | ĐườngDẫn&gt;</code> – Chuyển workspace\n"
+    "• <code>/new</code> – Bắt đầu hội thoại mới\n"
+    "• <code>/stop</code> – Huỷ tác vụ đang chạy\n\n"
+    "⚙️ <b>Cấu hình &amp; Quyền hạn:</b>\n"
+    "• <code>/model [id]</code> – Xem hoặc đổi model AI\n"
+    "• <code>/mode [default|accept-edits|plan]</code> – Chế độ duyệt\n"
+    "• <code>/auto [on|off]</code> – Tự động duyệt mọi yêu cầu\n\n"
+    "💡 <i>Các lệnh khác như <code>/goal</code>, <code>/plan</code>, <code>/browser</code> được chuyển thẳng cho Agent.</i>"
 )
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
-        await update.message.reply_text(f"⛔ Không có quyền. ID của bạn: {update.effective_user.id}")
+        await update.message.reply_text(
+            f"⛔ <b>Không có quyền truy cập.</b>\nID Telegram của bạn: <code>{update.effective_user.id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     s = get_session(context, update.effective_chat.id)
     await update.message.reply_text(
-        HELP + f"\n\n📁 <code>{html.escape(short_path(s.workspace))}</code>", parse_mode=ParseMode.HTML
+        HELP + f"\n\n📁 Workspace hiện tại: <code>{html.escape(short_path(s.workspace))}</code>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -817,15 +1065,16 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     s = get_session(context, update.effective_chat.id)
     proj = resolve_project_for_workspace(s.workspace, auto_create=False)
-    proj_str = f"{proj[1]} (<code>{proj[0][:8]}…</code>)" if proj else "CLI Project"
+    proj_str = f"<b>{html.escape(proj[1])}</b> (<code>{proj[0][:8]}…</code>)" if proj else "<i>CLI Project</i>"
     await update.message.reply_text(
-        f"📁 Workspace: <code>{html.escape(short_path(s.workspace))}</code>\n"
-        f"🗂 App Project: {proj_str}\n"
-        f"💬 Phiên: {html.escape(s.title or '(mới)')}\n"
-        f"🆔 <code>{s.session_id or '-'}</code>\n"
-        f"🧩 Model: {html.escape(s.model or 'mặc định')} · Mode: {html.escape(s.mode or 'default')}\n"
-        f"⚡ Auto-approve: {'BẬT ⚠️' if s.auto_approve else 'tắt'}\n"
-        f"⚙️ {'Đang chạy tác vụ' if s.busy else 'Rảnh'} · agy: {'đang chạy' if s.client and s.client.alive else 'chưa khởi động'}",
+        f"📊 <b>Trạng thái Antigravity Bridge</b>\n\n"
+        f"📁 <b>Workspace:</b> <code>{html.escape(short_path(s.workspace))}</code>\n"
+        f"🗂 <b>App Project:</b> {proj_str}\n"
+        f"💬 <b>Phiên:</b> {html.escape(s.title or '(mới)')}\n"
+        f"🆔 <b>Session ID:</b> <code>{s.session_id or '-'}</code>\n"
+        f"🧩 <b>Model:</b> <code>{html.escape(s.model or 'mặc định')}</code> · <b>Mode:</b> <code>{html.escape(s.mode or 'default')}</code>\n"
+        f"⚡ <b>Auto-approve:</b> {'<b>BẬT ⚠️</b>' if s.auto_approve else '<i>tắt</i>'}\n"
+        f"⚙️ <b>Trạng thái:</b> {'⏳ Đang chạy tác vụ' if s.busy else '✅ Rảnh'} · <b>agy:</b> {'🟢 đang chạy' if s.client and s.client.alive else '⚪ chưa khởi động'}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -835,10 +1084,16 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s = get_session(context, update.effective_chat.id)
     if s.busy:
-        await update.message.reply_text("⏳ Đang có tác vụ chạy. /stop trước.")
+        await update.message.reply_text(
+            "⏳ <b>Đang có tác vụ chạy.</b> Hãy gửi <code>/stop</code> trước.",
+            parse_mode=ParseMode.HTML,
+        )
         return
     await s.reset()
-    await update.message.reply_text("🆕 Tin nhắn tiếp theo sẽ bắt đầu hội thoại mới.")
+    await update.message.reply_text(
+        "🆕 <b>Đã tạo phiên mới.</b> Tin nhắn tiếp theo sẽ bắt đầu cuộc hội thoại mới.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -846,10 +1101,10 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s = get_session(context, update.effective_chat.id)
     if not s.busy:
-        await update.message.reply_text("Không có tác vụ nào đang chạy.")
+        await update.message.reply_text("ℹ️ <i>Hiện không có tác vụ nào đang chạy.</i>", parse_mode=ParseMode.HTML)
         return
     await s.cancel()
-    await update.message.reply_text("🛑 Đã gửi yêu cầu huỷ…")
+    await update.message.reply_text("🛑 <b>Đã gửi yêu cầu dừng tác vụ…</b>", parse_mode=ParseMode.HTML)
 
 
 async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -857,18 +1112,32 @@ async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s = get_session(context, update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text(f"📁 {s.workspace}\nCú pháp: /cd TenDuAn hoặc /cd /đường/dẫn")
+        await update.message.reply_text(
+            f"📁 <b>Workspace hiện tại:</b> <code>{html.escape(s.workspace)}</code>\n"
+            f"👉 Cú pháp: <code>/cd TenDuAn</code> hoặc <code>/cd /đường/dẫn</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     raw = os.path.expanduser(" ".join(context.args))
     target = os.path.abspath(raw if os.path.isabs(raw) else os.path.join(PROJECTS_ROOT, raw))
     if not os.path.isdir(target):
-        await update.message.reply_text(f"❌ Không tồn tại: {target}")
+        await update.message.reply_text(
+            f"❌ <b>Thư mục không tồn tại:</b> <code>{html.escape(target)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     if s.busy:
-        await update.message.reply_text("⏳ Đang có tác vụ chạy. /stop trước.")
+        await update.message.reply_text(
+            "⏳ <b>Đang có tác vụ chạy.</b> Hãy gửi <code>/stop</code> trước.",
+            parse_mode=ParseMode.HTML,
+        )
         return
     await s.reset(new_workspace=target)
-    await update.message.reply_text(f"✅ Workspace: {short_path(target)}\n(Hội thoại mới sẽ bắt đầu)")
+    await update.message.reply_text(
+        f"✅ <b>Đã chuyển Workspace sang:</b> <code>{html.escape(short_path(target))}</code>\n"
+        f"<i>(Hội thoại mới sẽ bắt đầu từ tin nhắn tiếp theo)</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def projects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -880,10 +1149,15 @@ async def projects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if not n.startswith(".") and os.path.isdir(os.path.join(PROJECTS_ROOT, n))
         )
     except OSError as e:
-        await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text(f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
         return
-    body = "\n".join(f"• {n}" for n in names) or "(trống)"
-    await update.message.reply_text(f"📂 {short_path(PROJECTS_ROOT)}\n{body}\n\nDùng /cd TenDuAn"[:MAX_TG_LEN])
+    body = "\n".join(f"• <code>{html.escape(n)}</code>" for n in names) or "<i>(trống)</i>"
+    await update.message.reply_text(
+        f"📂 <b>Danh sách dự án</b> (<code>{html.escape(short_path(PROJECTS_ROOT))}</code>):\n\n"
+        f"{body}\n\n"
+        f"👉 Dùng lệnh: <code>/cd TenDuAn</code>"[:MAX_TG_LEN],
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -894,22 +1168,26 @@ async def sessions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         client = await s.ensure()
         res = await client.request("session/list", {})
     except Exception as e:  # noqa: BLE001
-        await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text(f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
         return
     items = (res.get("sessions") or [])[:10]
     if not items:
-        await update.message.reply_text("Chưa có phiên nào.")
+        await update.message.reply_text("ℹ️ <i>Chưa có phiên hội thoại nào.</i>", parse_mode=ParseMode.HTML)
         return
     context.chat_data["session_list"] = {it["sessionId"][:8]: it for it in items}
     rows, lines = [], []
     for i, it in enumerate(items, 1):
-        mark = " 👈" if it["sessionId"] == s.session_id else ""
+        mark = " 👈 <i>(đang mở)</i>" if it["sessionId"] == s.session_id else ""
         when = (it.get("updatedAt") or "")[:16].replace("T", " ")
-        lines.append(f"{i}. {it.get('title') or '(không tên)'}{mark}\n    {short_path(it.get('cwd', ''))} · {when} UTC")
+        title_esc = html.escape(it.get("title") or "(không tên)")
+        cwd_esc = html.escape(short_path(it.get("cwd", "")))
+        lines.append(f"<b>{i}. {title_esc}</b>{mark}\n    📁 <code>{cwd_esc}</code> · 🕒 <i>{html.escape(when)} UTC</i>")
         rows.append([InlineKeyboardButton(f"{i}. {(it.get('title') or '?')[:40]}", callback_data=f"r:{it['sessionId'][:8]}")])
     await update.message.reply_text(
-        "🗂 Phiên gần đây (bấm để mở lại):\n\n" + "\n".join(lines)
-        + "\n\n⚠️ Tránh mở phiên đang được dùng đồng thời trong app.",
+        "🗂 <b>Các phiên làm việc gần đây</b> <i>(bấm nút bên dưới để mở lại)</i>:\n\n"
+        + "\n\n".join(lines)
+        + "\n\n⚠️ <i>Lưu ý: Tránh mở cùng lúc một phiên đang thao tác trên App máy tính.</i>",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -932,7 +1210,10 @@ async def resume_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state()
     await q.answer("Đã chọn phiên")
     await q.edit_message_text(
-        f"▶️ Tiếp tục phiên: {it.get('title') or it['sessionId']}\n📁 {short_path(s.workspace)}\nGửi tin nhắn để tiếp tục."
+        f"▶️ <b>Tiếp tục phiên:</b> {html.escape(it.get('title') or it['sessionId'])}\n"
+        f"📁 <b>Workspace:</b> <code>{html.escape(short_path(s.workspace))}</code>\n\n"
+        f"<i>Hãy gửi tin nhắn để tiếp tục công việc.</i>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -947,18 +1228,20 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 await s.client.request("session/set_model", {"sessionId": s.session_id, "modelId": s.model})
             except AcpError as e:
-                await update.message.reply_text(f"❌ {e}")
+                await update.message.reply_text(f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
                 return
-        await update.message.reply_text(f"🧩 Model: {s.model}")
+        await update.message.reply_text(f"🧩 <b>Đã chuyển sang Model:</b> <code>{html.escape(s.model)}</code>", parse_mode=ParseMode.HTML)
         return
     try:
         await s.ensure()
     except Exception as e:  # noqa: BLE001
-        await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text(f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
         return
     lines = [f"• <code>{html.escape(m['modelId'])}</code> – {html.escape(m.get('name', ''))}" for m in s.available_models]
     await update.message.reply_text(
-        f"🧩 Hiện tại: {html.escape(s.model or 'mặc định')}\n\n" + "\n".join(lines) + "\n\nDùng: /model &lt;id&gt;",
+        f"🧩 <b>Model hiện tại:</b> <code>{html.escape(s.model or 'mặc định')}</code>\n\n"
+        + "\n".join(lines)
+        + "\n\n👉 Dùng lệnh: <code>/model &lt;id&gt;</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -969,11 +1252,12 @@ async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_session(context, update.effective_chat.id)
     if not context.args or context.args[0] not in ("default", "accept-edits", "plan"):
         await update.message.reply_text(
-            f"Mode hiện tại: {s.mode or 'default'}\n"
-            "• default – hỏi trước khi sửa file & chạy lệnh\n"
-            "• accept-edits – tự sửa file trong workspace, hỏi khi chạy lệnh\n"
-            "• plan – lập kế hoạch kỹ trước khi làm\n"
-            "Dùng: /mode accept-edits"
+            f"🔀 <b>Chế độ hiện tại:</b> <code>{html.escape(s.mode or 'default')}</code>\n\n"
+            "• <code>default</code> – Hỏi trước khi sửa file &amp; chạy lệnh\n"
+            "• <code>accept-edits</code> – Tự sửa file trong workspace, hỏi khi chạy lệnh\n"
+            "• <code>plan</code> – Lập kế hoạch kỹ trước khi thực thi\n\n"
+            "👉 Dùng lệnh: <code>/mode accept-edits</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
     s.mode = context.args[0]
@@ -981,7 +1265,7 @@ async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if s.loaded and s.client and s.client.alive:
         with contextlib.suppress(AcpError):
             await s.client.request("session/set_mode", {"sessionId": s.session_id, "modeId": s.mode})
-    await update.message.reply_text(f"🔀 Mode: {s.mode}")
+    await update.message.reply_text(f"🔀 <b>Đã chuyển Mode:</b> <code>{html.escape(s.mode)}</code>", parse_mode=ParseMode.HTML)
 
 
 async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -992,7 +1276,9 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         s.auto_approve = context.args[0].lower() == "on"
         save_state()
     await update.message.reply_text(
-        "⚡ Auto-approve: " + ("BẬT ⚠️ (agent tự chạy mọi lệnh)" if s.auto_approve else "tắt (hỏi trước)")
+        "⚡ <b>Auto-approve:</b> "
+        + ("<b>BẬT ⚠️</b> <i>(Agent tự động chạy mọi lệnh)</i>" if s.auto_approve else "<b>TẮT</b> <i>(Hỏi trước qua nút bấm)</i>"),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1059,7 +1345,11 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS)
     for uid in ALLOWED_USER_IDS:
         with contextlib.suppress(Exception):
-            await app.bot.send_message(uid, "🟢 Antigravity bridge (agy) đã khởi động. /help để xem lệnh.")
+            await app.bot.send_message(
+                uid,
+                "🟢 <b>Antigravity Bridge (<code>agy</code>) đã khởi động!</b>\nGõ <code>/help</code> để xem danh sách lệnh.",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 async def post_shutdown(app: Application) -> None:
