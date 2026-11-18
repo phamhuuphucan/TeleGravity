@@ -100,12 +100,16 @@ Toàn bộ quy trình từ thiết lập trên máy cá nhân, đồng bộ phi�
 
 | Lệnh | Chức năng |
 | :--- | :--- |
-| *(Tin nhắn văn bản / Ảnh kèm caption)* | Giao việc trực tiếp cho Antigravity Agent |
-| `/status` | Xem Workspace, App Project, Phiên hiện tại, Model, Mode |
+| *(Chữ / Voice 🎙️ / Ảnh 📸 / File Forward 📄)* | Giao việc đa phương thức trực tiếp (có hàng đợi thông minh, không chặn khi bận) |
+| `/pa [yêu cầu]` | Chuyển ngay về không gian **Trợ lý Cá nhân** (`Personal_Assistant`) & xem tổng quan việc |
+| `/todo [nội dung]` | Quản lý việc cần làm (`TODOS.md`), bấm nút `✅` hoàn thành 1 chạm |
+| `/note [nội dung]` | Lưu ghi chú nhanh vào sổ tay cá nhân (`NOTES.md`) hoặc xem ghi chú gần đây |
+| `/remind [giờ + việc]` | Hẹn giờ nhắc việc có nút Snooze hoặc chạy AI định kỳ (`30p ...`, `16:30 ...`, `daily 07:30 ai: ...`) |
+| `/file [TừKhoá \| ĐườngDẫn]` | Tìm kiếm & tải file/thư mục trên máy (`~/`) về Telegram (tối đa 50 MB) |
+| `/status` | Xem Workspace, App Project, Phiên, Việc cần làm, Lịch hẹn, Model, Mode |
 | `/sessions` | Liệt kê 10 phiên gần nhất (cả trên App & Telegram) → bấm nút để mở lại |
 | `/projects` | Liệt kê danh sách các dự án trong `PROJECTS_ROOT` |
-| `/cd <TênDựÁn \| ĐườngDẫn>` | Chuyển nhanh sang dự án khác (ví dụ: `/cd WebApp`) |
-| `/file [TừKhoá \| ĐườngDẫn]` | Tìm kiếm & tải file/thư mục trên máy (`~/`) về Telegram (tối đa 50 MB) |
+| `/cd <TênDựÁn \| ĐườngDẫn>` | Chuyển sang dự án khác (tự động nhớ phiên đang làm dở của từng dự án) |
 | `/new` | Bắt đầu phiên hội thoại mới trên workspace hiện tại |
 | `/stop` | Dừng ngay lập tức tác vụ Agent đang thực thi |
 | `/model [id]` | Xem danh sách model khả dụng hoặc đổi model (Gemini, Claude...) |

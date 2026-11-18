@@ -38,22 +38,46 @@ echo "✅ Đã cài xong thư viện Python."
 # 4. Tạo file .env nếu chưa có
 if [[ ! -f "$DIR/.env" ]]; then
   cp "$DIR/.env.example" "$DIR/.env"
+
+  # Tự động dò múi giờ hệ thống làm gợi ý mặc định
+  DETECTED_TZ=""
+  if [[ -f /etc/timezone ]]; then
+    DETECTED_TZ="$(cat /etc/timezone 2>/dev/null | tr -d '[:space:]')"
+  elif [[ -L /etc/localtime ]]; then
+    LT_TARGET="$(readlink /etc/localtime 2>/dev/null || true)"
+    if [[ "$LT_TARGET" == *"/zoneinfo/"* ]]; then
+      DETECTED_TZ="${LT_TARGET#*zoneinfo/}"
+    fi
+  fi
+  DETECTED_TZ="${DETECTED_TZ:-Asia/Ho_Chi_Minh}"
+
   echo ""
-  echo "📝 Hãy cấu hình nhanh thông tin Bot Telegram (Enter để giữ mặc định):"
+  echo "📝 Hãy cấu hình nhanh thông tin Bot Telegram (Enter để giữ giá trị mặc định):"
   read -r -p "1. Nhập TELEGRAM_BOT_TOKEN (từ @BotFather): " tg_token
   read -r -p "2. Nhập ALLOWED_USER_IDS (từ @userinfobot): " tg_uid
-  read -r -p "3. Thư mục chứa các dự án code [mặc định: $HOME]: " ws_dir
-  ws_dir="${ws_dir:-$HOME}"
 
-  mkdir -p "$ws_dir"
+  default_projects="$HOME/Projects"
+  read -r -p "3. Thư mục gốc chứa các dự án code (PROJECTS_ROOT) [mặc định: $default_projects]: " ws_dir
+  ws_dir="${ws_dir:-$default_projects}"
+  ws_dir="${ws_dir/#\~/$HOME}"
+
+  default_pa="${ws_dir%/}/Personal_Assistant"
+  read -r -p "4. Thư mục Trợ lý cá nhân (ASSISTANT_HOME) [mặc định: $default_pa]: " pa_dir
+  pa_dir="${pa_dir:-$default_pa}"
+  pa_dir="${pa_dir/#\~/$HOME}"
+
+  read -r -p "5. Múi giờ lịch hẹn (ASSISTANT_TIMEZONE) [mặc định: $DETECTED_TZ]: " tz_val
+  tz_val="${tz_val:-$DETECTED_TZ}"
+
+  mkdir -p "$ws_dir" "$pa_dir"
 
   # Cập nhật vào .env
-  python3 - "$DIR/.env" "$tg_token" "$tg_uid" "$AGY_BIN" "$ws_dir" <<'PYEOF'
+  "$DIR/.venv/bin/python" - "$DIR/.env" "$tg_token" "$tg_uid" "$AGY_BIN" "$ws_dir" "$pa_dir" "$tz_val" <<'PYEOF'
 import sys
 from pathlib import Path
 
 env_path = Path(sys.argv[1])
-token, uid, agy_bin, ws = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+token, uid, agy_bin, ws, pa, tz = sys.argv[2:8]
 lines = env_path.read_text(encoding="utf-8").splitlines()
 out = []
 for line in lines:
@@ -63,10 +87,14 @@ for line in lines:
         out.append(f"ALLOWED_USER_IDS={uid}")
     elif line.startswith("AGY_PATH=") and agy_bin:
         out.append(f"AGY_PATH={agy_bin}")
-    elif line.startswith("DEFAULT_WORKSPACE="):
-        out.append(f"DEFAULT_WORKSPACE={ws}")
     elif line.startswith("PROJECTS_ROOT="):
         out.append(f"PROJECTS_ROOT={ws}")
+    elif line.startswith("ASSISTANT_HOME="):
+        out.append(f"ASSISTANT_HOME={pa}")
+    elif line.startswith("DEFAULT_WORKSPACE="):
+        out.append(f"DEFAULT_WORKSPACE={pa}")
+    elif line.startswith("ASSISTANT_TIMEZONE="):
+        out.append(f"ASSISTANT_TIMEZONE={tz}")
     else:
         out.append(line)
 env_path.write_text("\n".join(out) + "\n", encoding="utf-8")

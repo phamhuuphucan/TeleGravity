@@ -34,12 +34,13 @@ import unicodedata
 import urllib.parse
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, FileSizeLimit, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -83,25 +84,64 @@ def _resolve_agy_path() -> str:
     return os.path.expanduser(env_val or "~/.local/bin/agy")
 
 
+def _detect_system_timezone() -> str:
+    for env_key in ("ASSISTANT_TIMEZONE", "TZ"):
+        val = os.getenv(env_key, "").strip()
+        if val:
+            with contextlib.suppress(Exception):
+                ZoneInfo(val)
+                return val
+    etc_tz = Path("/etc/timezone")
+    if etc_tz.is_file():
+        with contextlib.suppress(Exception):
+            cand = etc_tz.read_text(encoding="utf-8").strip()
+            if cand:
+                ZoneInfo(cand)
+                return cand
+    localtime_p = Path("/etc/localtime")
+    if localtime_p.exists():
+        with contextlib.suppress(Exception):
+            real_lt = os.path.realpath(str(localtime_p))
+            if "/zoneinfo/" in real_lt:
+                cand = real_lt.split("/zoneinfo/", 1)[1].strip("/")
+                ZoneInfo(cand)
+                return cand
+    return "Asia/Ho_Chi_Minh"
+
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_USER_IDS = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
 AGY_PATH = _resolve_agy_path()
-_DEFAULT_WS_FALLBACK = "~/AN_Projects" if os.path.isdir(os.path.expanduser("~/AN_Projects")) else "~"
-DEFAULT_WORKSPACE = os.path.expanduser(os.getenv("DEFAULT_WORKSPACE", _DEFAULT_WS_FALLBACK))
-PROJECTS_ROOT = os.path.expanduser(os.getenv("PROJECTS_ROOT", DEFAULT_WORKSPACE))
+PROJECTS_ROOT = os.path.normpath(os.path.abspath(os.path.expanduser(
+    os.getenv("PROJECTS_ROOT", "").strip() or "~/Projects"
+)))
+ASSISTANT_HOME = os.path.normpath(os.path.abspath(os.path.expanduser(
+    os.getenv("ASSISTANT_HOME", "").strip() or os.path.join(PROJECTS_ROOT, "Personal_Assistant")
+)))
+_RAW_DEFAULT_WS = os.getenv("DEFAULT_WORKSPACE", "").strip()
+DEFAULT_WORKSPACE = os.path.normpath(os.path.abspath(os.path.expanduser(
+    _RAW_DEFAULT_WS if _RAW_DEFAULT_WS else ASSISTANT_HOME
+)))
+ASSISTANT_TIMEZONE_NAME = _detect_system_timezone()
+ASSISTANT_TZ = ZoneInfo(ASSISTANT_TIMEZONE_NAME)
+
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "").strip() or None
 DEFAULT_MODE = os.getenv("DEFAULT_MODE", "accept-edits").strip() or None
 AUTO_APPROVE_DEFAULT = os.getenv("AUTO_APPROVE", "false").lower() in ("1", "true", "yes")
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "600"))
 STATE_FILE = BASE_DIR / "data" / "state.json"
+SCHEDULES_FILE = BASE_DIR / "data" / "schedules.json"
 
 MAX_TG_LEN = 4000
-MAX_TG_UPLOAD_BYTES = int(FileSizeLimit.FILESIZE_UPLOAD)  # 50 MB (50,000,000 bytes) cho chuẩn Bot API
+MAX_TG_UPLOAD_BYTES = int(FileSizeLimit.FILESIZE_UPLOAD)      # 50 MB (50,000,000 bytes) gửi từ máy lên Telegram
+MAX_TG_DOWNLOAD_BYTES = int(FileSizeLimit.FILESIZE_DOWNLOAD)  # 20 MB (20,000,000 bytes) tải từ Telegram về máy
 MAX_AUTO_SEND_PER_TURN = 8
 MAX_QUICK_BUTTONS = 8
 PROGRESS_EDIT_INTERVAL = 2.0
+BURST_DEBOUNCE_SECONDS = 1.5
+INBOX_ATTACH_WINDOW_SECONDS = 300.0
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -525,6 +565,7 @@ SENSITIVE_EXTS = {
 }
 
 _RE_SEND_FILE_TAG = re.compile(r"`?\[\[SEND_FILE:([^\]]+?)\]\]`?")
+_RE_SCHEDULE_TAG = re.compile(r"`?\[\[SCHEDULE:(\{[^\n]+?\})\]\]`?")
 _RE_SEND_ACCENTED = re.compile(r"\b(gửi|tải về|đính kèm)\b")
 _RE_SEND_FOLDED = re.compile(
     r"\b(gui cho|gui file|gui tep|gui lai|gui giup|gui qua|gui vao|send|tai ve|tai file|download|lay file|dinh kem|attach)\b"
@@ -534,6 +575,10 @@ _RE_HINT_FOLDED = re.compile(
     r"\b(file|tep|tai lieu|bao cao|report|thu muc|folder|gui cho|gui file|gui lai|send|tai ve|tai file|download|"
     r"lay file|tim file|tim giup|find|search|xuat|export|luu vao|luu file|save|hinh anh|image|photo|"
     r"pdf|word|doc|docx|excel|xls|xlsx|csv|ppt|pptx|zip|markdown|truoc do|luc nay|vua roi|vua tao)\b"
+)
+_RE_SCHEDULE_FOLDED = re.compile(
+    r"\b(nhac|hen gio|dat lich|lich hen|moi sang|moi ngay|hang ngay|moi tuan|sang mai|chieu nay|toi nay|"
+    r"phut nua|tieng nua|gio nua|remind|schedule|cron|alarm)\b"
 )
 _RE_PREV_FILE_INTENT = re.compile(
     r"\b(file truoc|tep truoc|luc nay|vua roi|vua tao|file cu|hom qua|gui lai|lay lai)\b"
@@ -548,6 +593,10 @@ def _has_send_intent(user_text: str) -> bool:
 def _has_file_hint_intent(user_text: str) -> bool:
     low = user_text.lower()
     return bool(_RE_HINT_ACCENTED.search(low) or _RE_HINT_FOLDED.search(_fold_vi(low)))
+
+
+def _has_schedule_intent(user_text: str) -> bool:
+    return bool(_RE_SCHEDULE_FOLDED.search(_fold_vi(user_text)))
 
 FILE_REGISTRY: dict[str, str] = {}
 
@@ -575,7 +624,7 @@ def format_file_size(num_bytes: int) -> str:
 
 def _allowed_roots() -> list[Path]:
     roots: list[Path] = []
-    for raw in (str(Path.home()), DEFAULT_WORKSPACE, PROJECTS_ROOT):
+    for raw in (str(Path.home()), ASSISTANT_HOME, DEFAULT_WORKSPACE, PROJECTS_ROOT):
         if not raw:
             continue
         rp = Path(os.path.expanduser(raw)).resolve(strict=False)
@@ -1270,7 +1319,549 @@ def search_local_files(
 
 
 # ---------------------------------------------------------------------------
-# Phiên theo từng chat Telegram
+# Không gian Trợ lý Cá nhân (Personal Assistant Home), Bộ nhớ & Lịch trình 24/7
+# ---------------------------------------------------------------------------
+_WEEKDAY_VI = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+_WEEKDAY_SHORT_VI = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
+
+_DEFAULT_PA_GEMINI_MD = """# Trợ Lý Cá Nhân & Cố Vấn Công Việc (TeleGravity)
+
+Bạn là **Trợ lý Cá nhân chuyên biệt** phục vụ trực tiếp cho chủ sở hữu qua cổng kết nối Telegram.
+- **Ngôn ngữ & Xưng hô:** Linh hoạt điều chỉnh ngôn ngữ và cách xưng hô tự nhiên, lịch sự khớp với cách người dùng trò chuyện (ví dụ: *anh – em*, *chị – em*, *bạn – mình*...) và ghi nhớ vào `memory/PROFILE.md`.
+- **Phong cách làm việc:** Ngắn gọn, rõ ràng, thực tế, trình bày thoáng dễ đọc trên màn hình điện thoại. Ưu tiên thực thi ra kết quả thật (tra cứu thật, tính toán thật, tạo file thật, lưu bộ nhớ thật).
+
+## 1. Cấu trúc Bộ nhớ Dài hạn & Thư mục Cá nhân
+- `memory/PROFILE.md`: Hồ sơ cá nhân, cách xưng hô ưa thích, thói quen, nguyên tắc làm việc và các đối tác/liên hệ quan trọng của người dùng. Hãy chủ động đọc khi cần ngữ cảnh cá nhân, và **tự động cập nhật** khi người dùng chia sẻ thông tin mới hoặc dặn ghi nhớ.
+- `memory/TODOS.md`: Danh sách đầu việc cần làm (`- [ ] Nội dung` cho việc đang mở, `- [x] Nội dung` cho việc đã xong). Chủ động thêm hoặc đánh dấu hoàn thành khi người dùng giao việc/báo xong.
+- `memory/NOTES.md`: Sổ tay lưu ghi chú nhanh, biên bản cuộc họp, ý tưởng và thông tin tra cứu.
+- `inbox/`: Nơi lưu trữ toàn bộ file tài liệu, ảnh, tin nhắn thoại gửi từ Telegram vào.
+- `exports/`: Khi người dùng yêu cầu tạo báo cáo, bảng tính, hợp đồng, tài liệu tổng hợp... hãy lưu vào `exports/` với tên file rõ nghĩa và gắn thẻ `[[SEND_FILE:/đường/dẫn/tuyệt/đối]]` ở cuối câu trả lời để gửi file thật về Telegram.
+
+## 2. Xử lý Tin nhắn Thoại (Voice / Audio) & Tài liệu Đính kèm
+- Khi nhận yêu cầu kèm file âm thanh (`.ogg`, `.mp3`, `.m4a`, `.wav`), hãy dùng công cụ `read_file` đọc trực tiếp file âm thanh đó để nghe chính xác lời người dùng nói.
+- Mở đầu câu trả lời cho tin nhắn thoại bằng 1 dòng tóm tắt ngắn nội dung vừa nghe (ví dụ: `🎙️ *Nội dung ghi âm:* "..."`) rồi thực hiện ngay yêu cầu.
+- Với tài liệu gửi vào (`.pdf`, ảnh, video -> đọc bằng `read_file`; `.docx`, `.xlsx`, `.csv`, `.zip` -> đọc/xử lý bằng Python), hãy phân tích chính xác số liệu và nội dung trước khi trả lời.
+
+## 3. Đặt lịch Nhắc việc & Tác vụ Tự động Định kỳ (`[[SCHEDULE:...]]`)
+Khi người dùng dặn nhắc hẹn hoặc yêu cầu chạy báo cáo tự động theo lịch, hãy tính đúng ngày giờ theo thời gian hiện tại và đặt thẻ JSON trên một dòng riêng ở cuối câu trả lời (bên ngoài code block):
+- **Nhắc việc 1 lần (`once`):**
+  `[[SCHEDULE:{"kind":"once","run_at":"YYYY-MM-DD HH:MM","action":"notify","text":"Nội dung nhắc việc ngắn gọn"}]]`
+- **Hẹn giờ tự chạy tác vụ AI 1 lần (`once` + `agent`):**
+  `[[SCHEDULE:{"kind":"once","run_at":"YYYY-MM-DD HH:MM","action":"agent","title":"Tên tác vụ","text":"Hướng dẫn chi tiết tự chứa để Agent tự thực hiện khi tới giờ"}]]`
+- **Định kỳ hằng ngày / theo thứ trong tuần (`daily` / `weekly`, `days`: `0`=Thứ 2 .. `6`=Chủ nhật):**
+  - Chỉ gửi thông báo nhắc: `[[SCHEDULE:{"kind":"daily","time":"HH:MM","days":[0,1,2,3,4,5,6],"action":"notify","text":"Nội dung nhắc"}]]`
+  - Tự động chạy AI tổng hợp báo cáo/bản tin sáng: `[[SCHEDULE:{"kind":"daily","time":"HH:MM","days":[0,1,2,3,4,5,6],"action":"agent","title":"Bản tin sáng","text":"Đọc memory/TODOS.md, tổng hợp các việc cần làm hôm nay kèm tin tức quan trọng và gửi báo cáo ngắn gọn"}]]`
+"""
+
+_DEFAULT_PROFILE_MD = """# Hồ Sơ & Nguyên Tắc Cá Nhân
+
+## Thông tin chung
+- Kênh tương tác chính từ xa: Telegram (ưu tiên câu trả lời súc tích, gửi kèm file thật khi xuất tài liệu)
+- Cách xưng hô ưa thích: *(Trợ lý tự động cập nhật theo cách trò chuyện của bạn)*
+
+## Thói quen & Ưu tiên công việc
+- *(Trợ lý sẽ tự động ghi nhận và cập nhật thêm trong quá trình làm việc)*
+
+## Đối tác / Dự án / Liên hệ quan trọng
+- *(Cập nhật dần theo ngữ cảnh công việc)*
+"""
+
+_DEFAULT_TODOS_MD = """# Danh Sách Việc Cần Làm (To-Do)
+
+"""
+
+_DEFAULT_NOTES_MD = """# Sổ Tay Ghi Chú Cá Nhân (Notes)
+
+"""
+
+
+def now_local() -> datetime:
+    return datetime.now(ASSISTANT_TZ)
+
+
+def ensure_assistant_home() -> Path:
+    """Khởi tạo cấu trúc thư mục Đại bản doanh Trợ lý cá nhân nếu chưa tồn tại (an toàn đa nền tảng)."""
+    home_p = Path(ASSISTANT_HOME)
+    (home_p / "memory").mkdir(parents=True, exist_ok=True)
+    (home_p / "inbox").mkdir(parents=True, exist_ok=True)
+    (home_p / "exports").mkdir(parents=True, exist_ok=True)
+
+    defaults = [
+        (home_p / "GEMINI.md", _DEFAULT_PA_GEMINI_MD),
+        (home_p / "memory" / "PROFILE.md", _DEFAULT_PROFILE_MD),
+        (home_p / "memory" / "TODOS.md", _DEFAULT_TODOS_MD),
+        (home_p / "memory" / "NOTES.md", _DEFAULT_NOTES_MD),
+    ]
+    for fp, content in defaults:
+        if not fp.exists():
+            fp.write_text(content, encoding="utf-8")
+    return home_p
+
+
+def _todos_path() -> Path:
+    return ensure_assistant_home() / "memory" / "TODOS.md"
+
+
+def _notes_path() -> Path:
+    return ensure_assistant_home() / "memory" / "NOTES.md"
+
+
+def list_open_todos() -> list[tuple[int, str]]:
+    fp = _todos_path()
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[tuple[int, str]] = []
+    for idx, line in enumerate(lines):
+        m = re.match(r"^\s*-\s*\[\s\]\s+(.+)$", line)
+        if m:
+            out.append((idx, m.group(1).strip()))
+    return out
+
+
+def count_completed_todos() -> int:
+    fp = _todos_path()
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    return sum(1 for line in lines if re.match(r"^\s*-\s*\[[xX]\]\s+", line))
+
+
+def add_todo_item(text: str) -> None:
+    fp = _todos_path()
+    stamp = now_local().strftime("%d/%m %H:%M")
+    existing = fp.read_text(encoding="utf-8") if fp.exists() else _DEFAULT_TODOS_MD
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    existing += f"- [ ] {text.strip()} *(thêm {stamp})*\n"
+    tmp = fp.with_suffix(".md.tmp")
+    tmp.write_text(existing, encoding="utf-8")
+    tmp.replace(fp)
+
+
+def complete_todo_by_line(line_idx: int) -> str | None:
+    fp = _todos_path()
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    if not (0 <= line_idx < len(lines)):
+        return None
+    m = re.match(r"^(\s*-\s*)\[\s\]\s+(.+)$", lines[line_idx])
+    if not m:
+        return None
+    task_text = m.group(2).strip()
+    stamp = now_local().strftime("%d/%m %H:%M")
+    lines[line_idx] = f"{m.group(1)}[x] {task_text} *(xong {stamp})*"
+    tmp = fp.with_suffix(".md.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(fp)
+    return task_text
+
+
+def clear_completed_todos() -> int:
+    fp = _todos_path()
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    kept = [ln for ln in lines if not re.match(r"^\s*-\s*\[[xX]\]\s+", ln)]
+    removed = len(lines) - len(kept)
+    if removed > 0:
+        tmp = fp.with_suffix(".md.tmp")
+        tmp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        tmp.replace(fp)
+    return removed
+
+
+def add_note_item(text: str) -> None:
+    fp = _notes_path()
+    stamp = now_local().strftime("%d/%m/%Y %H:%M")
+    existing = fp.read_text(encoding="utf-8") if fp.exists() else _DEFAULT_NOTES_MD
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    existing += f"- **[{stamp}]** {text.strip()}\n"
+    tmp = fp.with_suffix(".md.tmp")
+    tmp.write_text(existing, encoding="utf-8")
+    tmp.replace(fp)
+
+
+def read_recent_notes(limit: int = 10) -> list[str]:
+    fp = _notes_path()
+    try:
+        lines = fp.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    bullets = [ln.strip()[2:].strip() for ln in lines if ln.strip().startswith("- ")]
+    return bullets[-limit:]
+
+
+def save_bytes_to_inbox(data: bytes, preferred_name: str) -> str:
+    """Lưu file/ghi âm nhận từ Telegram vào ASSISTANT_HOME/inbox an toàn, tránh ghi đè."""
+    inbox_dir = ensure_assistant_home() / "inbox"
+    clean_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", os.path.basename(preferred_name or "file")).strip(" .")
+    if not clean_name:
+        clean_name = f"item_{now_local().strftime('%Y%m%d_%H%M%S')}"
+    dest = inbox_dir / clean_name
+    if dest.exists():
+        stem, ext = os.path.splitext(clean_name)
+        dest = inbox_dir / f"{stem}_{now_local().strftime('%d%m_%H%M%S')}{ext}"
+    dest.write_bytes(data)
+    return os.path.normpath(str(dest))
+
+
+# ----- Bộ lập lịch Nhắc việc & Tác vụ Chủ động 24/7 (Scheduler) -----
+def load_schedules() -> list[dict]:
+    try:
+        raw = json.loads(SCHEDULES_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+SCHEDULES: list[dict] = load_schedules()
+
+
+def save_schedules() -> None:
+    SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Dọn các lịch 1 lần đã chạy xong quá 7 ngày để file luôn gọn nhẹ
+    cutoff = now_local() - timedelta(days=7)
+    kept: list[dict] = []
+    for it in SCHEDULES:
+        if not it.get("enabled", True) and it.get("kind") == "once":
+            fired_raw = it.get("fired_at") or it.get("run_at") or ""
+            with contextlib.suppress(ValueError):
+                if fired_raw and datetime.fromisoformat(fired_raw) < cutoff:
+                    continue
+        kept.append(it)
+    SCHEDULES[:] = kept
+    tmp = SCHEDULES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(SCHEDULES, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SCHEDULES_FILE)
+
+
+def _parse_local_datetime(raw: str) -> datetime | None:
+    s = raw.strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M"):
+        with contextlib.suppress(ValueError):
+            return datetime.strptime(s, fmt).replace(tzinfo=ASSISTANT_TZ)
+    with contextlib.suppress(ValueError):
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.astimezone(ASSISTANT_TZ) if dt.tzinfo else dt.replace(tzinfo=ASSISTANT_TZ)
+    return None
+
+
+def create_schedule_from_spec(spec: dict, chat_id: int) -> dict | None:
+    kind = str(spec.get("kind") or "once").strip().lower()
+    if kind not in ("once", "daily", "weekly"):
+        kind = "once"
+    action = str(spec.get("action") or "notify").strip().lower()
+    if action not in ("notify", "agent"):
+        action = "notify"
+    text = str(spec.get("text") or "").strip()
+    if not text:
+        return None
+    title = str(spec.get("title") or "").strip()
+    now = now_local()
+    sid = uuid.uuid4().hex[:8]
+
+    if kind == "once":
+        dt = _parse_local_datetime(str(spec.get("run_at") or ""))
+        if dt is None:
+            return None
+        item = {
+            "id": sid,
+            "chat_id": chat_id,
+            "kind": "once",
+            "action": action,
+            "title": title,
+            "text": text,
+            "run_at": dt.isoformat(),
+            "enabled": True,
+            "created_at": now.isoformat(),
+        }
+    else:
+        raw_time = str(spec.get("time") or "").strip().replace("h", ":")
+        m_t = re.match(r"^(\d{1,2}):(\d{2})$", raw_time)
+        if not m_t:
+            return None
+        hh, mm = int(m_t.group(1)), int(m_t.group(2))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        hm_str = f"{hh:02d}:{mm:02d}"
+        raw_days = spec.get("days")
+        if isinstance(raw_days, list) and raw_days:
+            days = sorted({int(d) for d in raw_days if isinstance(d, (int, str)) and str(d).isdigit() and 0 <= int(d) <= 6})
+        else:
+            days = [0, 1, 2, 3, 4, 5, 6]
+        if not days:
+            days = [0, 1, 2, 3, 4, 5, 6]
+        # Nếu giờ hẹn hôm nay đã trôi qua, đánh dấu đã qua ngày hôm nay để bắt đầu từ kỳ kế tiếp
+        sched_today = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        last_run_date = now.strftime("%Y-%m-%d") if now >= sched_today else ""
+        item = {
+            "id": sid,
+            "chat_id": chat_id,
+            "kind": "weekly" if len(days) < 7 else "daily",
+            "action": action,
+            "title": title,
+            "text": text,
+            "time": hm_str,
+            "days": days,
+            "last_run_date": last_run_date,
+            "enabled": True,
+            "created_at": now.isoformat(),
+        }
+
+    SCHEDULES.append(item)
+    save_schedules()
+    return item
+
+
+def format_schedule_human(item: dict) -> str:
+    act_badge = "🤖 Tự động chạy AI" if item.get("action") == "agent" else "🔔 Nhắc thông báo"
+    label = item.get("title") or item.get("text") or ""
+    if item.get("kind") == "once":
+        dt = _parse_local_datetime(item.get("run_at", ""))
+        when_str = dt.strftime("%H:%M ngày %d/%m/%Y") if dt else item.get("run_at", "?")
+        return f"<b>{html.escape(when_str)}</b> · <i>{act_badge}</i>\n    📌 {html.escape(label[:140])}"
+    days = item.get("days") or [0, 1, 2, 3, 4, 5, 6]
+    if len(days) == 7:
+        day_str = "Hằng ngày"
+    elif days == [0, 1, 2, 3, 4]:
+        day_str = "Thứ 2 – Thứ 6"
+    else:
+        day_str = ", ".join(_WEEKDAY_SHORT_VI[d] for d in days if 0 <= d <= 6)
+    return f"<b>{html.escape(item.get('time', '?'))} ({day_str})</b> · <i>{act_badge}</i>\n    📌 {html.escape(label[:140])}"
+
+
+def extract_schedule_tags_and_clean_text(md_text: str, chat_id: int) -> tuple[str, list[dict]]:
+    """Tách thẻ [[SCHEDULE:{...}]] bên ngoài code fence và đăng ký vào bộ hẹn giờ."""
+    created: list[dict] = []
+    out_lines: list[str] = []
+    in_fence = False
+    fence_marker = ""
+
+    for line in md_text.splitlines():
+        m_fence = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if not in_fence and m_fence:
+            in_fence = True
+            fence_marker = m_fence.group(1)[:3]
+            out_lines.append(line)
+            continue
+        if in_fence:
+            if line.strip().startswith(fence_marker) and line.strip().strip(fence_marker[0]) == "":
+                in_fence = False
+                fence_marker = ""
+            out_lines.append(line)
+            continue
+
+        def _pop_sched(m: re.Match) -> str:
+            try:
+                spec = json.loads(m.group(1))
+                if isinstance(spec, dict):
+                    it = create_schedule_from_spec(spec, chat_id)
+                    if it:
+                        created.append(it)
+            except json.JSONDecodeError:
+                log.warning("Không parse được thẻ SCHEDULE: %s", m.group(1))
+            return ""
+
+        cleaned = _RE_SCHEDULE_TAG.sub(_pop_sched, line)
+        if line.strip() and not cleaned.strip():
+            continue
+        out_lines.append(cleaned)
+
+    return "\n".join(out_lines).strip(), created
+
+
+def parse_quick_reminder(raw_arg: str, chat_id: int) -> dict | None:
+    """Parse nhanh cú pháp lệnh /remind phổ biến tốn 0s chờ AI (30p ..., 16:30 ..., 20/11 08:00 ..., daily 07:30 ...)."""
+    s = raw_arg.strip()
+    if not s:
+        return None
+    now = now_local()
+
+    def _split_action_text(body: str) -> tuple[str, str]:
+        b = body.strip()
+        m_ai = re.match(r"^(?:ai|agent)\s*:\s*(.+)$", b, re.IGNORECASE)
+        if m_ai:
+            return "agent", m_ai.group(1).strip()
+        return "notify", b
+
+    # 1. Khoảng thời gian tương đối: 30p, 15m, 2h, 1h30p...
+    m_rel = re.match(
+        r"^(\d+)\s*(s|giay|giây|m|min|p|ph|phut|phút|h|g|gio|giờ)"
+        r"(?:\s*(\d+)\s*(m|min|p|ph|phut|phút))?\s+(.+)$",
+        s,
+        re.IGNORECASE,
+    )
+    if m_rel:
+        val1, unit1, val2, _, body = m_rel.groups()
+        u1 = _fold_vi(unit1)
+        delta = timedelta()
+        if u1.startswith("s") or u1 == "giay":
+            delta += timedelta(seconds=int(val1))
+        elif u1 in ("h", "g", "gio"):
+            delta += timedelta(hours=int(val1))
+        else:
+            delta += timedelta(minutes=int(val1))
+        if val2:
+            delta += timedelta(minutes=int(val2))
+        act, txt = _split_action_text(body)
+        return create_schedule_from_spec(
+            {"kind": "once", "run_at": (now + delta).isoformat(), "action": act, "text": txt},
+            chat_id,
+        )
+
+    # 2. Lặp hằng ngày: daily 07:30 ... | hằng ngày 7h30 ...
+    m_daily = re.match(
+        r"^(?:daily|hang ngay|hằng ngày|moi ngay|mỗi ngày)\s+(\d{1,2})(?:[:h](\d{2}))?\s+(.+)$",
+        s,
+        re.IGNORECASE,
+    )
+    if m_daily:
+        hh, mm_s, body = m_daily.groups()
+        mm = int(mm_s) if mm_s else 0
+        act, txt = _split_action_text(body)
+        return create_schedule_from_spec(
+            {"kind": "daily", "time": f"{int(hh):02d}:{mm:02d}", "action": act, "text": txt},
+            chat_id,
+        )
+
+    # 3. Ngày/Tháng[/Năm] Giờ:Phút: 20/11 08:30 ...
+    m_dm = re.match(
+        r"^(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\s+(\d{1,2})(?:[:h](\d{2}))?\s+(.+)$",
+        s,
+        re.IGNORECASE,
+    )
+    if m_dm:
+        dd, mo, yyyy, hh, mm_s, body = m_dm.groups()
+        yr = int(yyyy) if yyyy else now.year
+        mm = int(mm_s) if mm_s else 0
+        with contextlib.suppress(ValueError):
+            target = datetime(yr, int(mo), int(dd), int(hh), mm, tzinfo=ASSISTANT_TZ)
+            if not yyyy and target <= now:
+                target = target.replace(year=yr + 1)
+            act, txt = _split_action_text(body)
+            return create_schedule_from_spec(
+                {"kind": "once", "run_at": target.isoformat(), "action": act, "text": txt},
+                chat_id,
+            )
+
+    # 4. Giờ trong ngày: 16:30 ... | 16h30 ... | 8h ...
+    m_hm = re.match(r"^(\d{1,2})(?:[:h](\d{2})|h)\s+(.+)$", s, re.IGNORECASE)
+    if m_hm:
+        hh_s, mm_s, body = m_hm.groups()
+        hh, mm = int(hh_s), (int(mm_s) if mm_s else 0)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            act, txt = _split_action_text(body)
+            return create_schedule_from_spec(
+                {"kind": "once", "run_at": target.isoformat(), "action": act, "text": txt},
+                chat_id,
+            )
+
+    return None
+
+
+async def _trigger_schedule_item(app: Application, item: dict) -> None:
+    chat_id = int(item["chat_id"])
+    sid = item["id"]
+    now = now_local()
+
+    if item.get("action") == "agent":
+        if chat_id not in SESSIONS:
+            SESSIONS[chat_id] = Session(app, chat_id, _SAVED.get(str(chat_id)))
+        s = SESSIONS[chat_id]
+        if not s.busy and os.path.normcase(s.workspace) != os.path.normcase(ASSISTANT_HOME):
+            await s.switch_workspace(ASSISTANT_HOME)
+        label = item.get("title") or item.get("text", "")[:70]
+        with contextlib.suppress(Exception):
+            await app.bot.send_message(
+                chat_id,
+                f"⏰ <b>Trợ lý tự động thực thi lịch hẹn</b> (<i>{now.strftime('%H:%M')}</i>):\n"
+                f"📌 <i>{html.escape(label)}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        await s.enqueue_prompt([{"type": "text", "text": item["text"]}], immediate=True)
+        return
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Đã xong", callback_data=f"s:ack:{sid}"),
+            InlineKeyboardButton("💤 +30 phút", callback_data=f"s:snz30:{sid}"),
+        ],
+        [
+            InlineKeyboardButton("📅 Sáng mai 08:00", callback_data=f"s:tmr:{sid}"),
+        ],
+    ])
+    await app.bot.send_message(
+        chat_id,
+        f"⏰ <b>NHẮC VIỆC</b> (<i>{now.strftime('%H:%M · %d/%m/%Y')}</i>)\n\n"
+        f"📌 <b>{html.escape(item.get('text', ''))}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def scheduler_loop(app: Application) -> None:
+    """Vòng lặp nền kiểm tra lịch nhắc việc & tác vụ tự động mỗi 15 giây."""
+    while True:
+        try:
+            now = now_local()
+            today_str = now.strftime("%Y-%m-%d")
+            dirty = False
+            to_fire: list[dict] = []
+
+            for item in list(SCHEDULES):
+                if not item.get("enabled", True):
+                    continue
+                kind = item.get("kind", "once")
+                if kind == "once":
+                    dt = _parse_local_datetime(item.get("run_at", ""))
+                    if dt and now >= dt:
+                        item["enabled"] = False
+                        item["fired_at"] = now.isoformat()
+                        dirty = True
+                        to_fire.append(item)
+                else:
+                    days = item.get("days") or [0, 1, 2, 3, 4, 5, 6]
+                    if item.get("last_run_date") == today_str or now.weekday() not in days:
+                        continue
+                    raw_t = item.get("time", "")
+                    if ":" not in raw_t:
+                        continue
+                    hh, mm = map(int, raw_t.split(":", 1))
+                    sched_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    diff_sec = (now - sched_dt).total_seconds()
+                    if diff_sec >= 0:
+                        item["last_run_date"] = today_str
+                        dirty = True
+                        if item.get("action") == "agent" and diff_sec > 7200:
+                            log.info("Bỏ qua tác vụ AI định kỳ quá hạn >2h: %s", item.get("id"))
+                        else:
+                            to_fire.append(item)
+
+            if dirty:
+                save_schedules()
+            for f_item in to_fire:
+                asyncio.create_task(_trigger_schedule_item(app, f_item))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("Lỗi trong vòng lặp scheduler_loop")
+        await asyncio.sleep(15.0)
+
+
+# ---------------------------------------------------------------------------
+# Phiên theo từng chat Telegram (Hỗ trợ Hàng đợi, Đa Workspace & Bộ nhớ PA)
 # ---------------------------------------------------------------------------
 KIND_ICONS = {
     "execute": "💻", "read": "👀", "edit": "✏️", "delete": "🗑️", "move": "📦",
@@ -1291,21 +1882,46 @@ class Session:
         self.title: str = saved.get("title", "")
         self.recent_files: list[str] = list(saved.get("recent_files") or [])[:30]
         self.known_files: list[str] = list(saved.get("known_files") or [])[:80]
+        self.workspace_sessions: dict[str, dict[str, str]] = dict(saved.get("workspace_sessions") or {})
+        if self.workspace and self.session_id:
+            ws_key = os.path.normpath(os.path.abspath(self.workspace))
+            self.workspace_sessions.setdefault(
+                ws_key, {"session_id": self.session_id, "title": self.title}
+            )
         self.client: AcpClient | None = None
         self.loaded = False  # session_id đã được new/load trong tiến trình hiện tại
         self.bridge_hint_sent = False  # đã gửi ngữ cảnh Telegram Bridge cho phiên hiện tại chưa
         self.available_models: list[dict] = []
         self.task: asyncio.Task | None = None
+        self.queue: list[dict[str, Any]] = []
+        self._burst_buf: list[dict] = []
+        self._burst_task: asyncio.Task | None = None
+        self.pending_inbox_files: list[tuple[str, float, Message | None]] = []
         self.pending: dict[str, tuple[asyncio.Future, list[dict]]] = {}
         # Bộ thu cho lượt hiện tại
         self._collect: dict | None = None
         self._lock = asyncio.Lock()
 
+    def _sync_ws_memory(self) -> None:
+        if self.workspace and self.session_id:
+            ws_key = os.path.normpath(os.path.abspath(self.workspace))
+            self.workspace_sessions[ws_key] = {
+                "session_id": self.session_id,
+                "title": self.title,
+            }
+
     def to_dict(self) -> dict:
+        self._sync_ws_memory()
         return {
-            "workspace": self.workspace, "session_id": self.session_id, "model": self.model,
-            "mode": self.mode, "auto_approve": self.auto_approve, "title": self.title,
-            "recent_files": self.recent_files[:30], "known_files": self.known_files[:80],
+            "workspace": self.workspace,
+            "session_id": self.session_id,
+            "model": self.model,
+            "mode": self.mode,
+            "auto_approve": self.auto_approve,
+            "title": self.title,
+            "recent_files": self.recent_files[:30],
+            "known_files": self.known_files[:80],
+            "workspace_sessions": self.workspace_sessions,
         }
 
     def record_recent_file(self, path_str: str) -> None:
@@ -1322,30 +1938,97 @@ class Session:
         self.known_files.insert(0, norm_path)
         del self.known_files[80:]
 
-    def _build_augmented_prompt(self, prompt: list[dict]) -> tuple[list[dict], str]:
-        user_text = "\n".join(b.get("text", "") for b in prompt if b.get("type") == "text")
-        folded = _fold_vi(user_text)
-        need_hint = (not self.bridge_hint_sent) or _has_file_hint_intent(user_text)
-        if not need_hint:
-            return prompt, user_text
+    def consume_recent_inbox_files(self) -> list[str]:
+        """Lấy các file anh vừa forward vào Inbox (trong vòng 5 phút) chưa xử lý để gắn vào tin nhắn chữ kế tiếp."""
+        if not self.pending_inbox_files:
+            return []
+        cutoff = time.monotonic() - INBOX_ATTACH_WINDOW_SECONDS
+        paths: list[str] = []
+        for p, ts, card_msg in self.pending_inbox_files:
+            if ts >= cutoff and os.path.exists(p):
+                paths.append(p)
+                if card_msg is not None:
+                    asyncio.create_task(self._clear_card_buttons(card_msg))
+        self.pending_inbox_files.clear()
+        return paths
 
-        recent_note = ""
+    @staticmethod
+    async def _clear_card_buttons(msg: Message) -> None:
+        with contextlib.suppress(Exception):
+            await msg.edit_reply_markup(None)
+
+    def _prepare_inbox_mirrors(self, prompt: list[dict]) -> list[dict]:
+        """Nếu đang ở dự án ngoài ASSISTANT_HOME, tạo bản sao tạm vào brain/<sid>/scratch để đọc không cần hỏi quyền."""
+        ws_same = os.path.normcase(os.path.abspath(self.workspace)) == os.path.normcase(os.path.abspath(ASSISTANT_HOME))
+        cleaned_blocks: list[dict] = []
+        for raw_b in prompt:
+            b = dict(raw_b)
+            inbox_list: list[str] = b.pop("_inbox_files", None) or []
+            if inbox_list and b.get("type") == "text":
+                txt = b.get("text") or ""
+                for orig_p in inbox_list:
+                    read_p = orig_p
+                    if not ws_same and self.session_id and os.path.isfile(orig_p):
+                        scratch_dir = AGY_DATA_DIR / "brain" / self.session_id / "scratch"
+                        with contextlib.suppress(OSError):
+                            scratch_dir.mkdir(parents=True, exist_ok=True)
+                            mirror_p = scratch_dir / os.path.basename(orig_p)
+                            shutil.copy2(orig_p, mirror_p)
+                            read_p = str(mirror_p)
+                    txt = txt.replace(f"{{READ_PATH:{orig_p}}}", read_p)
+                b["text"] = txt
+            cleaned_blocks.append({k: v for k, v in b.items() if not k.startswith("_")})
+        return cleaned_blocks
+
+    def _build_augmented_prompt(self, prompt: list[dict]) -> tuple[list[dict], str]:
+        ready_prompt = self._prepare_inbox_mirrors(prompt)
+        user_text = "\n".join(b.get("text", "") for b in ready_prompt if b.get("type") == "text")
+        folded = _fold_vi(user_text)
+
+        now = now_local()
+        clock_str = f"{now.strftime('%Y-%m-%d %H:%M')} ({_WEEKDAY_VI[now.weekday()]}, {ASSISTANT_TIMEZONE_NAME})"
+
+        need_full_hint = (
+            (not self.bridge_hint_sent)
+            or _has_file_hint_intent(user_text)
+            or _has_schedule_intent(user_text)
+            or "🎙️" in user_text
+        )
+
+        if not need_full_hint:
+            # Gắn nhãn đồng hồ siêu gọn (1 dòng) để Trợ lý luôn biết chính xác ngày giờ hiện tại
+            short_clock = f"\n\n[🕒 Thời gian hiện tại: {clock_str}]"
+            out_p = [dict(b) for b in ready_prompt]
+            for b in out_p:
+                if b.get("type") == "text":
+                    b["text"] = (b.get("text") or "") + short_clock
+                    break
+            return out_p, user_text
+
+        extra_lines: list[str] = []
+        if os.path.normcase(os.path.abspath(self.workspace)) != os.path.normcase(os.path.abspath(ASSISTANT_HOME)):
+            extra_lines.append(
+                f"- Không gian & Bộ nhớ Trợ lý cá nhân nằm tại: {ASSISTANT_HOME} "
+                f"(memory/PROFILE.md, memory/TODOS.md, memory/NOTES.md)."
+            )
         if self.recent_files and _RE_PREV_FILE_INTENT.search(folded):
             existing_recent = [p for p in self.recent_files if os.path.exists(p)][:5]
             if existing_recent:
-                recent_note = "\n- Các file làm việc gần đây của anh: " + ", ".join(existing_recent)
+                extra_lines.append("- Các file làm việc gần đây: " + ", ".join(existing_recent))
 
+        extra_str = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
         hint = (
-            "\n\n[Hệ thống Telegram Bridge: Người dùng đang làm việc từ xa qua Telegram nên không mở được link file:// cục bộ.\n"
-            "- Khi người dùng yêu cầu tạo/làm/xuất một file kết quả hoặc yêu cầu tìm/lấy/gửi lại file hay thư mục trên máy tính "
-            "(kể cả trong ~/Desktop, ~/Documents, ~/Downloads...), sau khi lưu xong hoặc tìm đúng đường dẫn thật, "
-            "hãy chèn thẻ [[SEND_FILE:/đường/dẫn/tuyệt/đối]] vào cuối câu trả lời (mỗi file/thư mục 1 thẻ).\n"
-            "- Bot sẽ tự động ẩn thẻ này và gửi file thật (tối đa 50MB; thư mục được tự nén .zip) thẳng vào Telegram. "
-            "Tuyệt đối KHÔNG tự chạy curl/script gọi Telegram API.\n"
-            "- Nếu chỉ đang sửa nhiều file mã nguồn mà người dùng không yêu cầu gửi file, không cần gắn thẻ [[SEND_FILE:...]]."
-            f"{recent_note}]"
+            f"\n\n[Hệ thống Telegram Bridge · 🕒 Hiện tại: {clock_str}\n"
+            "- Người dùng đang làm việc từ xa qua Telegram nên không mở được link file:// cục bộ.\n"
+            "- Gửi file/thư mục về Telegram: Khi tạo/xuất xong file kết quả hoặc tìm thấy file/thư mục người dùng yêu cầu gửi, "
+            "chèn thẻ [[SEND_FILE:/đường/dẫn/tuyệt/đối]] ở cuối câu trả lời (tối đa 50MB; thư mục tự nén .zip; không tự gọi curl API Telegram).\n"
+            "- Đặt lịch nhắc việc / chạy định kỳ: Khi người dùng dặn nhắc hẹn hoặc đặt lịch tự động, chèn thẻ JSON ở cuối câu trả lời:\n"
+            "  • 1 lần: [[SCHEDULE:{\"kind\":\"once\",\"run_at\":\"YYYY-MM-DD HH:MM\",\"action\":\"notify\",\"text\":\"Nội dung\"}]]\n"
+            "  • Định kỳ (days: 0=T2..6=CN, action=\"notify\" hoặc \"agent\"): "
+            "[[SCHEDULE:{\"kind\":\"daily\",\"time\":\"HH:MM\",\"days\":[0,1,2,3,4,5,6],\"action\":\"notify\",\"text\":\"Nội dung\"}]]"
+            f"{extra_str}]"
         )
-        new_prompt = [dict(b) for b in prompt]
+        new_prompt = [dict(b) for b in ready_prompt]
         for b in new_prompt:
             if b.get("type") == "text":
                 b["text"] = (b.get("text") or "") + hint
@@ -1359,9 +2042,96 @@ class Session:
     def busy(self) -> bool:
         return self.task is not None and not self.task.done()
 
+    # ----- Hàng đợi tin nhắn thông minh & Gom tin nhắn liên tiếp (Debounce) -----
+    @staticmethod
+    def _merge_prompt_blocks(blocks: list[dict]) -> list[dict]:
+        merged: list[dict] = []
+        for b in blocks:
+            if (
+                b.get("type") == "text"
+                and merged
+                and merged[-1].get("type") == "text"
+            ):
+                prev = dict(merged[-1])
+                prev["text"] = (prev.get("text") or "") + "\n" + (b.get("text") or "")
+                prev_inbox = list(prev.get("_inbox_files") or [])
+                for ip in b.get("_inbox_files") or []:
+                    if ip not in prev_inbox:
+                        prev_inbox.append(ip)
+                if prev_inbox:
+                    prev["_inbox_files"] = prev_inbox
+                merged[-1] = prev
+            else:
+                merged.append(dict(b))
+        return merged
+
+    async def enqueue_prompt(self, prompt: list[dict], immediate: bool = False) -> None:
+        if not self.busy and not immediate:
+            self._burst_buf.extend(prompt)
+            if self._burst_task and not self._burst_task.done():
+                self._burst_task.cancel()
+            self._burst_task = self.app.create_task(self._flush_burst_after_delay())
+            return
+
+        if self._burst_buf:
+            if self._burst_task and not self._burst_task.done():
+                self._burst_task.cancel()
+            flushed = self._merge_prompt_blocks(self._burst_buf)
+            self._burst_buf.clear()
+            self.queue.append({"id": uuid.uuid4().hex[:8], "prompt": flushed, "notice": None})
+
+        qid = uuid.uuid4().hex[:8]
+        notice_msg: Message | None = None
+        if self.busy:
+            pos = len(self.queue) + 1
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑️ Huỷ yêu cầu chờ này", callback_data=f"q:rm:{qid}"),
+            ]])
+            with contextlib.suppress(Exception):
+                notice_msg = await self.app.bot.send_message(
+                    self.chat_id,
+                    f"📥 <b>Đã xếp vào hàng đợi (#{pos})</b> — sẽ tự động thực hiện ngay sau tác vụ hiện tại.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+
+        self.queue.append({"id": qid, "prompt": prompt, "notice": notice_msg})
+        self._ensure_worker()
+
+    async def _flush_burst_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(BURST_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if not self._burst_buf:
+            return
+        merged = self._merge_prompt_blocks(self._burst_buf)
+        self._burst_buf.clear()
+        self.queue.append({"id": uuid.uuid4().hex[:8], "prompt": merged, "notice": None})
+        self._ensure_worker()
+
+    def _ensure_worker(self) -> None:
+        if not self.busy and self.queue:
+            self.task = self.app.create_task(self._run_queue_loop())
+
+    async def _run_queue_loop(self) -> None:
+        while self.queue:
+            item = self.queue.pop(0)
+            notice: Message | None = item.get("notice")
+            if notice is not None:
+                with contextlib.suppress(Exception):
+                    await notice.delete()
+            await self.run_turn(item["prompt"])
+            if not self.queue and os.path.exists(__file__) and os.path.getmtime(__file__) != _BOT_START_MTIME:
+                log.info("Phát hiện bot.py thay đổi -> tự động nạp lại khi hàng đợi đã rỗng")
+                save_state()
+                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+
     # ----- vòng đời -----
     async def ensure(self) -> AcpClient:
         async with self._lock:
+            if os.path.normcase(os.path.abspath(self.workspace)) == os.path.normcase(os.path.abspath(ASSISTANT_HOME)):
+                ensure_assistant_home()
             # agy dùng thư mục của tiến trình làm cwd cho lệnh shell -> đổi workspace thì khởi động lại.
             if self.client is not None and self.client.alive and self.client.cwd != self.workspace:
                 await self.client.stop()
@@ -1370,7 +2140,7 @@ class Session:
                 self.client = AcpClient(self.workspace, self._on_update, self._on_permission)
                 await self.client.start()
                 self.loaded = False
-                log.info("Đã khởi chạy agy acp cho chat %s", self.chat_id)
+                log.info("Đã khởi chạy agy acp cho chat %s tại %s", self.chat_id, self.workspace)
             if not self.loaded:
                 if self.session_id:
                     try:
@@ -1386,6 +2156,7 @@ class Session:
                 self.available_models = (res.get("models") or {}).get("availableModels", [])
                 self.loaded = True
                 self.bridge_hint_sent = False
+                self._sync_ws_memory()
                 await self._apply_settings()
                 save_state()
                 sync_antigravity_projects(self.session_id, self.workspace)
@@ -1411,10 +2182,33 @@ class Session:
                     "session/set_mode", {"sessionId": self.session_id, "modeId": self.mode}
                 )
 
+    async def switch_workspace(self, target_workspace: str) -> bool:
+        """Chuyển workspace và tự động khôi phục lại phiên đang làm dở của workspace đó (nếu có)."""
+        self._sync_ws_memory()
+        target_norm = os.path.normpath(os.path.abspath(target_workspace))
+        prev = self.workspace_sessions.get(target_norm)
+        self.workspace = target_norm
+        if prev and prev.get("session_id"):
+            self.session_id = prev["session_id"]
+            self.title = prev.get("title", "")
+            resumed = True
+        else:
+            self.session_id = None
+            self.title = ""
+            resumed = False
+        self.loaded = False
+        self.bridge_hint_sent = False
+        save_state()
+        return resumed
+
     async def reset(self, new_workspace: str | None = None, session_id: str | None = None) -> None:
-        """Chuyển sang phiên mới (hoặc phiên cho trước) ở lần chat tiếp theo."""
+        """Tạo phiên trắng mới (hoặc chuyển tới session_id chỉ định)."""
         if new_workspace:
-            self.workspace = new_workspace
+            self._sync_ws_memory()
+            self.workspace = os.path.normpath(os.path.abspath(new_workspace))
+        ws_key = os.path.normpath(os.path.abspath(self.workspace))
+        if session_id is None:
+            self.workspace_sessions.pop(ws_key, None)
         self.session_id = session_id
         self.title = ""
         self.loaded = False
@@ -1422,6 +2216,8 @@ class Session:
         save_state()
 
     async def shutdown(self) -> None:
+        if self._burst_task and not self._burst_task.done():
+            self._burst_task.cancel()
         self._resolve_all_pending()
         if self.client:
             await self.client.stop()
@@ -1437,6 +2233,7 @@ class Session:
         kind = u.get("sessionUpdate")
         if kind == "session_info_update" and u.get("title"):
             self.title = u["title"]
+            self._sync_ws_memory()
             sync_antigravity_projects(self.session_id, self.workspace)
         c = self._collect
         if c is None:  # ví dụ: lịch sử được phát lại khi session/load
@@ -1590,8 +2387,9 @@ class Session:
                 await status.edit_text(head, parse_mode=ParseMode.HTML)
 
             raw_text = "".join(c["text"])
+            text_no_sched, created_schedules = extract_schedule_tags_and_clean_text(raw_text, chat_id)
             clean_text, explicit_paths, linked_paths = extract_agent_files_and_clean_text(
-                raw_text, self.workspace
+                text_no_sched, self.workspace
             )
             scanned_deliverables: list[str] = []
             if stop == "end_turn":
@@ -1619,15 +2417,22 @@ class Session:
             quick_kb = build_quick_download_markup(quick_dl_paths, session=self)
             await send_long(self.app, chat_id, clean_text, reply_markup=quick_kb)
 
+            for sched_it in created_schedules:
+                kb_sched = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗑️ Huỷ lịch này", callback_data=f"s:del:{sched_it['id']}"),
+                ]])
+                await bot.send_message(
+                    chat_id,
+                    f"⏰ <b>Đã cài lịch thành công:</b>\n{format_schedule_human(sched_it)}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_sched,
+                )
+
             for ap in auto_send_paths:
                 try:
                     await send_path_to_telegram(self.app, chat_id, ap, session=self)
                 except Exception:  # noqa: BLE001
                     log.exception("Lỗi gửi file đính kèm %s", ap)
-
-            if os.path.exists(__file__) and os.path.getmtime(__file__) != _BOT_START_MTIME:
-                log.info("Phát hiện bot.py thay đổi -> tự động nạp lại sau lượt chat")
-                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -2010,37 +2815,35 @@ def authorized(update: Update) -> bool:
     return ok
 
 
-async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: list[dict]) -> None:
+async def submit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: list[dict],
+    immediate: bool = False,
+) -> None:
     s = get_session(context, update.effective_chat.id)
-    if s.busy:
-        await update.message.reply_text(
-            "⏳ <b>Agent đang bận.</b> Gửi <code>/stop</code> để huỷ tác vụ hiện tại.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    s.task = context.application.create_task(s.run_turn(prompt))
+    await s.enqueue_prompt(prompt, immediate=immediate)
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 HELP = (
-    "🤖 <b>Antigravity qua Telegram</b>\n"
-    "<i>Gửi tin nhắn văn bản hoặc ảnh kèm chú thích để giao việc cho Agent.</i>\n\n"
-    "📌 <b>Quản lý Phiên &amp; Dự án:</b>\n"
-    "• <code>/status</code> – Trạng thái hệ thống &amp; phiên hiện tại\n"
+    "🤖 <b>Trợ Lý Cá Nhân Antigravity (TeleGravity)</b>\n"
+    "<i>Gửi tin nhắn chữ, giọng nói (Voice 🎙️), ảnh 📸 hoặc chuyển tiếp File 📄 để giao việc.</i>\n\n"
+    "🏠 <b>Trợ Lý Cá Nhân &amp; Bộ Nhớ:</b>\n"
+    "• <code>/pa [yêu cầu]</code> – Về không gian Trợ lý cá nhân &amp; xem việc hôm nay\n"
+    "• <code>/todo [nội dung]</code> – Xem/tick hoàn thành hoặc thêm việc cần làm\n"
+    "• <code>/note [nội dung]</code> – Ghi chú nhanh vào sổ tay hoặc xem ghi chú\n"
+    "• <code>/remind [giờ + việc]</code> – Đặt nhắc việc / lịch tự động (vd: <code>30p</code>, <code>16:30</code>)\n"
+    "• <code>/file [từ khoá | đường dẫn]</code> – Tìm &amp; tải file/folder trên máy về Telegram\n\n"
+    "💻 <b>Quản lý Phiên &amp; Dự án Code:</b>\n"
+    "• <code>/status</code> – Trạng thái hệ thống, hàng đợi &amp; lịch hẹn\n"
+    "• <code>/projects</code> · <code>/cd &lt;DựÁn&gt;</code> – Chuyển đổi giữa các dự án (tự nhớ phiên)\n"
     "• <code>/sessions</code> – Mở lại các phiên gần đây (App &amp; Telegram)\n"
-    "• <code>/projects</code> – Liệt kê danh sách dự án\n"
-    "• <code>/cd &lt;TênDựÁn | ĐườngDẫn&gt;</code> – Chuyển workspace\n"
-    "• <code>/file [TừKhoá | ĐườngDẫn]</code> – Tìm &amp; tải file/folder trên máy về Telegram\n"
-    "• <code>/new</code> – Bắt đầu hội thoại mới\n"
-    "• <code>/stop</code> – Huỷ tác vụ đang chạy\n\n"
-    "⚙️ <b>Cấu hình &amp; Quyền hạn:</b>\n"
-    "• <code>/model [id]</code> – Xem hoặc đổi model AI\n"
-    "• <code>/mode [default|accept-edits|plan]</code> – Chế độ duyệt\n"
-    "• <code>/auto [on|off]</code> – Tự động duyệt mọi yêu cầu\n"
-    "• <code>/restart</code> – Khởi động lại bot từ xa\n\n"
-    "💡 <i>File báo cáo/tài liệu tạo xong sẽ tự động gửi về chat (tối đa 50 MB). Các lệnh như <code>/goal</code>, <code>/plan</code>, <code>/browser</code> được chuyển thẳng cho Agent.</i>"
+    "• <code>/new</code> – Tạo hội thoại mới · <code>/stop</code> – Dừng tác vụ đang chạy\n\n"
+    "⚙️ <b>Cấu hình:</b> <code>/model</code> · <code>/mode</code> · <code>/auto</code> · <code>/restart</code>\n"
+    "💡 <i>Gửi file tối đa 50 MB, nhận file/voice tới 20 MB. Các lệnh <code>/goal</code>, <code>/plan</code>, <code>/browser</code> chuyển thẳng cho Agent.</i>"
 )
 
 
@@ -2052,8 +2855,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     s = get_session(context, update.effective_chat.id)
+    is_pa = os.path.normcase(os.path.abspath(s.workspace)) == os.path.normcase(os.path.abspath(ASSISTANT_HOME))
+    mode_badge = "🏠 Trợ lý Cá nhân" if is_pa else "💻 Dự án Code"
     await update.message.reply_text(
-        HELP + f"\n\n📁 Workspace hiện tại: <code>{html.escape(short_path(s.workspace))}</code>",
+        HELP + f"\n\n📁 <b>Không gian hiện tại ({mode_badge}):</b> <code>{html.escape(short_path(s.workspace))}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2061,20 +2866,359 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    s = get_session(context, update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    s = get_session(context, chat_id)
     proj = resolve_project_for_workspace(s.workspace, auto_create=False)
     proj_str = f"<b>{html.escape(proj[1])}</b> (<code>{proj[0][:8]}…</code>)" if proj else "<i>CLI Project</i>"
+    is_pa = os.path.normcase(os.path.abspath(s.workspace)) == os.path.normcase(os.path.abspath(ASSISTANT_HOME))
+    ws_badge = "🏠 Trợ lý Cá nhân" if is_pa else "💻 Dự án"
+    open_todos = len(list_open_todos())
+    active_scheds = sum(
+        1 for it in SCHEDULES if it.get("enabled", True) and int(it.get("chat_id", 0)) == chat_id
+    )
+    q_str = f" · <b>Hàng đợi:</b> {len(s.queue)}" if s.queue else ""
     await update.message.reply_text(
-        f"📊 <b>Trạng thái Antigravity Bridge</b>\n\n"
-        f"📁 <b>Workspace:</b> <code>{html.escape(short_path(s.workspace))}</code>\n"
+        f"📊 <b>Trạng thái Trợ Lý Antigravity</b>\n\n"
+        f"📁 <b>Không gian ({ws_badge}):</b> <code>{html.escape(short_path(s.workspace))}</code>\n"
         f"🗂 <b>App Project:</b> {proj_str}\n"
         f"💬 <b>Phiên:</b> {html.escape(s.title or '(mới)')}\n"
         f"🆔 <b>Session ID:</b> <code>{s.session_id or '-'}</code>\n"
+        f"📋 <b>Việc cần làm:</b> <b>{open_todos}</b> mục mở · ⏰ <b>Lịch hẹn:</b> <b>{active_scheds}</b> đang bật\n"
         f"🧩 <b>Model:</b> <code>{html.escape(s.model or 'mặc định')}</code> · <b>Mode:</b> <code>{html.escape(s.mode or 'default')}</code>\n"
         f"⚡ <b>Auto-approve:</b> {'<b>BẬT ⚠️</b>' if s.auto_approve else '<i>tắt</i>'}\n"
-        f"⚙️ <b>Trạng thái:</b> {'⏳ Đang chạy tác vụ' if s.busy else '✅ Rảnh'} · <b>agy:</b> {'🟢 đang chạy' if s.client and s.client.alive else '⚪ chưa khởi động'}",
+        f"⚙️ <b>Trạng thái:</b> {'⏳ Đang chạy' if s.busy else '✅ Sẵn sàng'}{q_str} · <b>agy:</b> {'🟢 đang chạy' if s.client and s.client.alive else '⚪ chờ gọi'}",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def pa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    ensure_assistant_home()
+    chat_id = update.effective_chat.id
+    s = get_session(context, chat_id)
+    raw_arg = re.sub(r"^/\S+\s*", "", update.message.text or "", count=1).strip()
+    in_pa = os.path.normcase(os.path.abspath(s.workspace)) == os.path.normcase(os.path.abspath(ASSISTANT_HOME))
+
+    if not in_pa:
+        if s.busy:
+            await update.message.reply_text(
+                f"⏳ <b>Đang chạy tác vụ tại:</b> <code>{html.escape(short_path(s.workspace))}</code>\n"
+                f"👉 Gửi <code>/stop</code> nếu anh muốn chuyển về Trợ lý cá nhân ngay.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        resumed = await s.switch_workspace(ASSISTANT_HOME)
+    else:
+        resumed = bool(s.session_id)
+
+    if raw_arg:
+        await s.enqueue_prompt([{"type": "text", "text": raw_arg}], immediate=True)
+        return
+
+    open_todos = list_open_todos()
+    active_scheds = [
+        it for it in SCHEDULES if it.get("enabled", True) and int(it.get("chat_id", 0)) == chat_id
+    ]
+    sess_desc = (
+        f"Tiếp tục phiên <b>{html.escape(s.title or s.session_id[:8])}</b>"
+        if resumed and s.session_id else "Sẵn sàng bắt đầu phiên mới"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📋 Việc cần làm ({len(open_todos)})", callback_data="t:view:0"),
+        InlineKeyboardButton(f"⏰ Lịch hẹn ({len(active_scheds)})", callback_data="s:view:0"),
+    ]])
+    await update.message.reply_text(
+        f"🏠 <b>Không Gian Trợ Lý Cá Nhân</b>\n"
+        f"📁 <code>{html.escape(short_path(ASSISTANT_HOME))}</code>\n"
+        f"💬 {sess_desc}\n\n"
+        f"• 📋 <b>Việc đang mở:</b> {len(open_todos)} công việc\n"
+        f"• ⏰ <b>Lịch nhắc/định kỳ:</b> {len(active_scheds)} lịch đang bật\n\n"
+        f"<i>Anh có thể nhắn chữ, gửi Voice 🎙️ hoặc Forward tài liệu 📄 vào đây bất cứ lúc nào.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+def _render_todos_view() -> tuple[str, InlineKeyboardMarkup | None]:
+    open_items = list_open_todos()
+    done_cnt = count_completed_todos()
+    lines = ["📋 <b>Danh Sách Việc Cần Làm (To-Do)</b>\n"]
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if not open_items:
+        lines.append("✨ <i>Tuyệt vời, hiện không có đầu việc nào tồn đọng!</i>")
+    else:
+        for idx, (line_no, txt) in enumerate(open_items[:15], 1):
+            lines.append(f"<b>{idx}.</b> ▫️ {_format_inline(txt)}")
+            short_lbl = re.sub(r"\s*\*\([^)]*\)\*\s*$", "", txt).strip()
+            rows.append([
+                InlineKeyboardButton(f"✅ Xong #{idx}: {short_lbl[:30]}", callback_data=f"t:done:{line_no}")
+            ])
+        if len(open_items) > 15:
+            lines.append(f"<i>… và {len(open_items) - 15} đầu việc khác trong TODOS.md</i>")
+
+    if done_cnt > 0:
+        lines.append(f"\n✅ <i>Đã hoàn thành: {done_cnt} việc</i>")
+        rows.append([InlineKeyboardButton(f"🧹 Dọn {done_cnt} việc đã xong", callback_data="t:clr:0")])
+
+    lines.append("\n👉 <i>Thêm nhanh:</i> <code>/todo Nội dung công việc</code>")
+    return "\n".join(lines)[:MAX_TG_LEN], (InlineKeyboardMarkup(rows) if rows else None)
+
+
+async def todo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    raw_arg = re.sub(r"^/\S+\s*", "", update.message.text or "", count=1).strip()
+    if raw_arg:
+        add_todo_item(raw_arg)
+        body, kb = _render_todos_view()
+        await update.message.reply_text(
+            f"➕ <b>Đã thêm việc cần làm!</b>\n\n{body}"[:MAX_TG_LEN],
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return
+    body, kb = _render_todos_view()
+    await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def todo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not authorized(update):
+        await q.answer("⛔", show_alert=True)
+        return
+    parts = (q.data or "").split(":", 2)
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, action, val = parts
+    if action == "done":
+        done_txt = complete_todo_by_line(int(val))
+        await q.answer("✅ Đã hoàn thành!" if done_txt else "Mục này đã được cập nhật.")
+    elif action == "clr":
+        removed = clear_completed_todos()
+        await q.answer(f"🧹 Đã dọn {removed} việc hoàn thành.")
+    else:
+        await q.answer()
+    body, kb = _render_todos_view()
+    with contextlib.suppress(BadRequest):
+        await q.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    s = get_session(context, update.effective_chat.id)
+    raw_arg = re.sub(r"^/\S+\s*", "", update.message.text or "", count=1).strip()
+    notes_fp = str(_notes_path())
+    tok = register_file_token(notes_fp, s)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Tải sổ tay NOTES.md", callback_data=f"f:dl:{tok}")]])
+
+    if raw_arg:
+        add_note_item(raw_arg)
+        save_state()
+        await update.message.reply_text(
+            f"📝 <b>Đã lưu vào Sổ tay cá nhân:</b>\n<blockquote>{html.escape(raw_arg)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return
+
+    recent_notes = read_recent_notes(10)
+    save_state()
+    if not recent_notes:
+        await update.message.reply_text(
+            "📓 <b>Sổ Tay Ghi Chú Cá Nhân</b>\n\n"
+            "<i>Chưa có ghi chú nào.</i>\n"
+            "👉 Ghi nhanh: <code>/note Nội dung cần lưu</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    rendered_items = "\n".join(f"• {_format_inline(n)}" for n in reversed(recent_notes))
+    await update.message.reply_text(
+        f"📓 <b>10 Ghi Chú Gần Nhất</b> (<code>NOTES.md</code>):\n\n{rendered_items}\n\n"
+        f"👉 <i>Thêm ghi chú mới:</i> <code>/note Nội dung...</code>"[:MAX_TG_LEN],
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+def _render_schedules_view(chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    active = [
+        it for it in SCHEDULES
+        if it.get("enabled", True) and int(it.get("chat_id", 0)) == chat_id
+    ]
+    lines = ["⏰ <b>Lịch Nhắc Việc &amp; Tác Vụ Định Kỳ</b>\n"]
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if not active:
+        lines.append("<i>Hiện chưa có lịch hẹn nào đang bật.</i>")
+    else:
+        for idx, it in enumerate(active[:12], 1):
+            lines.append(f"<b>{idx}.</b> {format_schedule_human(it)}")
+            short_t = (it.get("title") or it.get("text") or "lịch")[:26]
+            rows.append([
+                InlineKeyboardButton(f"🗑️ Xoá #{idx}: {short_t}", callback_data=f"s:del:{it['id']}")
+            ])
+
+    lines.append(
+        "\n💡 <b>Đặt lịch nhanh:</b>\n"
+        "• <code>/remind 30p Gọi lại đối tác</code>\n"
+        "• <code>/remind 16:30 Họp kiểm tra tiến độ</code>\n"
+        "• <code>/remind 20/11 08:00 Chúc mừng</code>\n"
+        "• <code>/remind daily 07:30 ai: Tổng hợp việc cần làm sáng nay</code>\n"
+        "• <i>Hoặc nhắn/nói tự nhiên với Trợ lý để đặt lịch bất kỳ!</i>"
+    )
+    return "\n".join(lines)[:MAX_TG_LEN], (InlineKeyboardMarkup(rows) if rows else None)
+
+
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    chat_id = update.effective_chat.id
+    raw_arg = re.sub(r"^/\S+\s*", "", update.message.text or "", count=1).strip()
+    if not raw_arg:
+        body, kb = _render_schedules_view(chat_id)
+        await update.message.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    created = parse_quick_reminder(raw_arg, chat_id)
+    if created is not None:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑️ Huỷ lịch này", callback_data=f"s:del:{created['id']}"),
+        ]])
+        await update.message.reply_text(
+            f"⏰ <b>Đã cài lịch thành công:</b>\n{format_schedule_human(created)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return
+
+    # Nếu câu phức tạp bằng ngôn ngữ tự nhiên -> chuyển cho Agent tự phân tích giờ & cài đặt
+    await submit(
+        update,
+        context,
+        [{"type": "text", "text": f"Hãy đặt lịch nhắc việc / hẹn giờ theo yêu cầu sau của anh: {raw_arg}"}],
+        immediate=True,
+    )
+
+
+async def schedule_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not authorized(update):
+        await q.answer("⛔", show_alert=True)
+        return
+    parts = (q.data or "").split(":", 2)
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, action, sid = parts
+    chat_id = update.effective_chat.id
+    now = now_local()
+
+    if action == "view":
+        await q.answer()
+        body, kb = _render_schedules_view(chat_id)
+        with contextlib.suppress(BadRequest):
+            await q.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    target = next((it for it in SCHEDULES if it.get("id") == sid), None)
+
+    if action == "del":
+        if target and target.get("enabled", True):
+            target["enabled"] = False
+            save_schedules()
+            await q.answer("🗑️ Đã xoá lịch hẹn.")
+        else:
+            await q.answer("Lịch này đã kết thúc hoặc bị xoá trước đó.")
+        body, kb = _render_schedules_view(chat_id)
+        with contextlib.suppress(BadRequest):
+            if q.message and "Lịch Nhắc Việc" in (q.message.text or ""):
+                await q.edit_message_text(body, parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                await q.edit_message_text(
+                    (q.message.text_html or "") + "\n\n🗑️ <b>Đã huỷ lịch hẹn này.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+        return
+
+    if action == "ack":
+        await q.answer("✅ Đã ghi nhận hoàn thành!")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(
+                (q.message.text_html or "") + f"\n\n✅ <b>Đã hoàn thành</b> (<i>{now.strftime('%H:%M')}</i>)",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    orig_text = (target or {}).get("text")
+    if not orig_text and q.message and q.message.text:
+        lines = [ln.strip("📌 ").strip() for ln in q.message.text.splitlines() if ln.strip()]
+        orig_text = lines[-1] if lines else "Nhắc việc"
+
+    if action == "snz30":
+        new_dt = now + timedelta(minutes=30)
+        create_schedule_from_spec(
+            {"kind": "once", "run_at": new_dt.isoformat(), "action": "notify", "text": orig_text},
+            chat_id,
+        )
+        await q.answer(f"💤 Sẽ nhắc lại lúc {new_dt.strftime('%H:%M')}")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(
+                (q.message.text_html or "") + f"\n\n💤 <b>Đã hẹn nhắc lại lúc {new_dt.strftime('%H:%M')} (+30 phút)</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    if action == "tmr":
+        tmr_dt = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+        create_schedule_from_spec(
+            {"kind": "once", "run_at": tmr_dt.isoformat(), "action": "notify", "text": orig_text},
+            chat_id,
+        )
+        await q.answer(f"📅 Đã dời sang 08:00 ngày {tmr_dt.strftime('%d/%m')}")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(
+                (q.message.text_html or "") + f"\n\n📅 <b>Đã dời sang 08:00 sáng mai ({tmr_dt.strftime('%d/%m')})</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+
+async def queue_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not authorized(update):
+        await q.answer("⛔", show_alert=True)
+        return
+    parts = (q.data or "").split(":", 2)
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, action, qid = parts
+    s = get_session(context, update.effective_chat.id)
+    if action == "clr":
+        cnt = len(s.queue)
+        for item in s.queue:
+            if item.get("notice"):
+                with contextlib.suppress(Exception):
+                    await item["notice"].delete()
+        s.queue.clear()
+        await q.answer(f"🗑️ Đã xoá {cnt} yêu cầu trong hàng đợi.")
+        with contextlib.suppress(Exception):
+            await q.edit_message_reply_markup(None)
+        return
+    if action == "rm":
+        idx = next((i for i, it in enumerate(s.queue) if it.get("id") == qid), None)
+        if idx is None:
+            await q.answer("Yêu cầu này đã bắt đầu chạy hoặc đã xoá.")
+            with contextlib.suppress(Exception):
+                await q.edit_message_reply_markup(None)
+            return
+        s.queue.pop(idx)
+        await q.answer("🗑️ Đã xoá khỏi hàng đợi.")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text("🗑️ <i>Đã huỷ yêu cầu chờ trong hàng đợi.</i>", parse_mode=ParseMode.HTML)
 
 
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2098,11 +3242,22 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     s = get_session(context, update.effective_chat.id)
-    if not s.busy:
+    if not s.busy and not s.queue:
         await update.message.reply_text("ℹ️ <i>Hiện không có tác vụ nào đang chạy.</i>", parse_mode=ParseMode.HTML)
         return
     await s.cancel()
-    await update.message.reply_text("🛑 <b>Đã gửi yêu cầu dừng tác vụ…</b>", parse_mode=ParseMode.HTML)
+    kb = None
+    extra = ""
+    if s.queue:
+        extra = f"\n📥 <i>Đang còn <b>{len(s.queue)}</b> yêu cầu trong hàng đợi.</i>"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🗑️ Xoá luôn {len(s.queue)} yêu cầu chờ", callback_data="q:clr:all"),
+        ]])
+    await update.message.reply_text(
+        f"🛑 <b>Đã gửi yêu cầu dừng tác vụ hiện tại…</b>{extra}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
 
 
 async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2112,7 +3267,7 @@ async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
             f"📁 <b>Workspace hiện tại:</b> <code>{html.escape(s.workspace)}</code>\n"
-            f"👉 Cú pháp: <code>/cd TenDuAn</code> hoặc <code>/cd /đường/dẫn</code>",
+            f"👉 Cú pháp: <code>/cd TenDuAn</code>, <code>/cd /đường/dẫn</code> hoặc <code>/pa</code> (về Trợ lý cá nhân)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2130,10 +3285,14 @@ async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
-    await s.reset(new_workspace=target)
+    resumed = await s.switch_workspace(target)
+    sess_note = (
+        f"▶️ <i>Tự động khôi phục phiên đang làm dở:</i> <b>{html.escape(s.title or s.session_id[:8])}</b> (gõ <code>/new</code> nếu muốn tạo phiên trắng)"
+        if resumed and s.session_id
+        else "<i>(Hội thoại mới sẽ bắt đầu từ tin nhắn tiếp theo)</i>"
+    )
     await update.message.reply_text(
-        f"✅ <b>Đã chuyển Workspace sang:</b> <code>{html.escape(short_path(target))}</code>\n"
-        f"<i>(Hội thoại mới sẽ bắt đầu từ tin nhắn tiếp theo)</i>",
+        f"✅ <b>Đã chuyển Workspace sang:</b> <code>{html.escape(short_path(target))}</code>\n{sess_note}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2141,6 +3300,10 @@ async def cd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def projects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
+    ensure_assistant_home()
+    s = get_session(context, update.effective_chat.id)
+    cur_norm = os.path.normcase(os.path.abspath(s.workspace))
+    pa_norm = os.path.normcase(os.path.abspath(ASSISTANT_HOME))
     try:
         names = sorted(
             n for n in os.listdir(PROJECTS_ROOT)
@@ -2149,11 +3312,17 @@ async def projects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except OSError as e:
         await update.message.reply_text(f"❌ <b>Lỗi:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
         return
-    body = "\n".join(f"• <code>{html.escape(n)}</code>" for n in names) or "<i>(trống)</i>"
+    item_lines: list[str] = []
+    for n in names:
+        full_n = os.path.normcase(os.path.abspath(os.path.join(PROJECTS_ROOT, n)))
+        mark = " 👈 <i>(đang mở)</i>" if full_n == cur_norm else ""
+        prefix = "🏠" if full_n == pa_norm else "•"
+        item_lines.append(f"{prefix} <code>{html.escape(n)}</code>{mark}")
+    body = "\n".join(item_lines) or "<i>(trống)</i>"
     await update.message.reply_text(
-        f"📂 <b>Danh sách dự án</b> (<code>{html.escape(short_path(PROJECTS_ROOT))}</code>):\n\n"
+        f"📂 <b>Danh sách Không gian &amp; Dự án</b> (<code>{html.escape(short_path(PROJECTS_ROOT))}</code>):\n\n"
         f"{body}\n\n"
-        f"👉 Dùng lệnh: <code>/cd TenDuAn</code>"[:MAX_TG_LEN],
+        f"👉 Dùng <code>/pa</code> (về Trợ lý cá nhân) hoặc <code>/cd TenDuAn</code>"[:MAX_TG_LEN],
         parse_mode=ParseMode.HTML,
     )
 
@@ -2459,21 +3628,251 @@ async def file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+def _format_inbox_refs(paths: list[str]) -> str:
+    lines: list[str] = []
+    for p in paths:
+        fname = os.path.basename(p)
+        lines.append(
+            f"📄 File đính kèm người dùng gửi trong Inbox: `{fname}` "
+            f"(đường dẫn đọc trực tiếp: `{{READ_PATH:{p}}}`, bản lưu gốc: `{p}`)"
+        )
+    return "\n".join(lines)
+
+
 async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    await submit(update, context, [{"type": "text", "text": update.message.text}])
+    s = get_session(context, update.effective_chat.id)
+    attached = s.consume_recent_inbox_files()
+    user_txt = update.message.text or ""
+    if attached:
+        combined = _format_inbox_refs(attached) + "\n\nYêu cầu của người dùng:\n" + user_txt
+        await submit(
+            update,
+            context,
+            [{"type": "text", "text": combined, "_inbox_files": attached}],
+            immediate=True,
+        )
+        return
+    await submit(update, context, [{"type": "text", "text": user_txt}], immediate=False)
 
 
 async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    f = await update.message.photo[-1].get_file()
-    data = base64.b64encode(bytes(await f.download_as_bytearray())).decode()
-    await submit(update, context, [
-        {"type": "text", "text": update.message.caption or "Hãy xem ảnh này."},
-        {"type": "image", "mimeType": "image/jpeg", "data": data},
+    photo_obj = update.message.photo[-1]
+    if photo_obj.file_size and photo_obj.file_size > MAX_TG_DOWNLOAD_BYTES:
+        await update.message.reply_text(
+            "⚠️ <b>Ảnh vượt giới hạn tải xuống 20 MB của Telegram Bot API.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    f = await photo_obj.get_file()
+    raw_bytes = bytes(await f.download_as_bytearray())
+    # Lưu bản sao vào inbox để người dùng luôn tìm/lấy lại được về sau
+    saved_path = await asyncio.to_thread(
+        save_bytes_to_inbox, raw_bytes, f"photo_{now_local().strftime('%Y%m%d_%H%M%S')}.jpg"
+    )
+    s = get_session(context, update.effective_chat.id)
+    s.record_recent_file(saved_path)
+    save_state()
+    data = base64.b64encode(raw_bytes).decode()
+    caption = (update.message.caption or "").strip() or "Hãy xem và xử lý ảnh này."
+    await submit(
+        update,
+        context,
+        [
+            {"type": "text", "text": f"{caption}\n(Ảnh đã được lưu tại `{saved_path}`)"},
+            {"type": "image", "mimeType": "image/jpeg", "data": data},
+        ],
+        immediate=True,
+    )
+
+
+async def voice_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    media = update.message.voice or update.message.audio
+    if media is None:
+        return
+    if media.file_size and media.file_size > MAX_TG_DOWNLOAD_BYTES:
+        await update.message.reply_text(
+            f"⚠️ <b>File âm thanh quá lớn ({format_file_size(media.file_size)}):</b> "
+            f"vượt giới hạn tải xuống <b>20 MB</b> của Telegram Bot API.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+    tg_file = await media.get_file()
+    raw_bytes = bytes(await tg_file.download_as_bytearray())
+
+    if update.message.voice:
+        pref_name = f"voice_{now_local().strftime('%Y%m%d_%H%M%S')}.ogg"
+    else:
+        orig_fn = getattr(media, "file_name", None) or ""
+        ext = os.path.splitext(orig_fn)[1].lower()
+        if not ext:
+            mime = (getattr(media, "mime_type", None) or "").lower()
+            ext = ".mp3" if "mpeg" in mime or "mp3" in mime else (".m4a" if "mp4" in mime or "m4a" in mime else ".ogg")
+        pref_name = orig_fn or f"audio_{now_local().strftime('%Y%m%d_%H%M%S')}{ext}"
+
+    saved_path = await asyncio.to_thread(save_bytes_to_inbox, raw_bytes, pref_name)
+    s = get_session(context, update.effective_chat.id)
+    s.record_recent_file(saved_path)
+    attached_docs = s.consume_recent_inbox_files()
+    save_state()
+
+    dur = getattr(media, "duration", None)
+    dur_str = f" ({dur}s)" if dur else ""
+    caption = (update.message.caption or "").strip()
+    extra_doc_str = ("\n" + _format_inbox_refs(attached_docs)) if attached_docs else ""
+    cap_str = f"\nChú thích kèm theo: {caption}" if caption else ""
+
+    prompt_txt = (
+        f"🎙️ Người dùng vừa gửi tin nhắn thoại{dur_str} (file âm thanh tại `{{READ_PATH:{saved_path}}}`, bản lưu gốc `{saved_path}`).{extra_doc_str}{cap_str}\n"
+        f"Hãy dùng công cụ `read_file` đọc trực tiếp file âm thanh `{{READ_PATH:{saved_path}}}` để nghe chính xác nội dung lời nói, "
+        f"mở đầu phản hồi bằng 1 dòng tóm tắt ngắn nội dung vừa nghe (`🎙️ *Nội dung ghi âm:* \"...\"`) rồi thực hiện ngay yêu cầu."
+    )
+    await submit(
+        update,
+        context,
+        [{"type": "text", "text": prompt_txt, "_inbox_files": [saved_path] + attached_docs}],
+        immediate=True,
+    )
+
+
+async def doc_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        return
+    media = update.message.document or update.message.video
+    if media is None:
+        return
+    orig_name = getattr(media, "file_name", None) or (
+        f"video_{now_local().strftime('%Y%m%d_%H%M%S')}.mp4"
+        if update.message.video
+        else f"document_{now_local().strftime('%Y%m%d_%H%M%S')}"
+    )
+    fsize = getattr(media, "file_size", None) or 0
+    if fsize > MAX_TG_DOWNLOAD_BYTES:
+        await update.message.reply_text(
+            f"⚠️ <b>Không thể tải file về máy:</b> <code>{html.escape(orig_name)}</code> "
+            f"(<b>{format_file_size(fsize)}</b>) vượt giới hạn tải xuống tối đa <b>20 MB</b> của Telegram Bot API.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+    tg_file = await media.get_file()
+    raw_bytes = bytes(await tg_file.download_as_bytearray())
+    saved_path = await asyncio.to_thread(save_bytes_to_inbox, raw_bytes, orig_name)
+
+    s = get_session(context, update.effective_chat.id)
+    s.record_recent_file(saved_path)
+    save_state()
+
+    caption = (update.message.caption or "").strip()
+    if caption:
+        prompt_txt = (
+            f"{_format_inbox_refs([saved_path])}\n\n"
+            f"Yêu cầu kèm theo: {caption}\n"
+            f"(Gợi ý: đọc trực tiếp bằng `read_file` nếu là PDF/ảnh/audio/video/văn bản, hoặc dùng Python nếu là .docx/.xlsx/.zip)."
+        )
+        await submit(
+            update,
+            context,
+            [{"type": "text", "text": prompt_txt, "_inbox_files": [saved_path]}],
+            immediate=True,
+        )
+        return
+
+    # Không có caption (vd: Forward nhanh file) -> chờ nhẹ 1.8s xem có tin nhắn chữ nối theo không
+    entry_ts = time.monotonic()
+    s.pending_inbox_files.append((saved_path, entry_ts, None))
+    await asyncio.sleep(1.8)
+
+    if not any(p == saved_path and ts == entry_ts for p, ts, _ in s.pending_inbox_files):
+        return
+
+    tok = register_file_token(saved_path, s)
+    save_state()
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Tóm tắt nội dung", callback_data=f"i:sum:{tok}"),
+            InlineKeyboardButton("📊 Phân tích chi tiết", callback_data=f"i:ana:{tok}"),
+        ],
+        [
+            InlineKeyboardButton("✅ Chỉ lưu vào Inbox", callback_data=f"i:keep:{tok}"),
+        ],
     ])
+    card_msg = await update.message.reply_text(
+        f"📥 <b>Đã nhận &amp; lưu vào Inbox:</b> <code>{html.escape(os.path.basename(saved_path))}</code> "
+        f"(<code>{format_file_size(len(raw_bytes))}</code>)\n"
+        f"📁 <code>{html.escape(short_path(saved_path))}</code>\n\n"
+        f"<i>Hãy gõ yêu cầu xử lý ngay bên dưới, hoặc chọn nhanh:</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+    s.pending_inbox_files = [
+        (p, ts, card_msg if (p == saved_path and ts == entry_ts) else cm)
+        for p, ts, cm in s.pending_inbox_files
+    ]
+
+
+async def inbox_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not authorized(update):
+        await q.answer("⛔", show_alert=True)
+        return
+    parts = (q.data or "").split(":", 2)
+    if len(parts) != 3:
+        await q.answer()
+        return
+    _, action, tok = parts
+    s = get_session(context, update.effective_chat.id)
+    target_path = resolve_file_token(tok)
+    if not target_path or not os.path.exists(target_path):
+        await q.answer("Không tìm thấy file trong Inbox.", show_alert=True)
+        return
+
+    s.pending_inbox_files = [(p, ts, cm) for p, ts, cm in s.pending_inbox_files if p != target_path]
+
+    if action == "keep":
+        await q.answer("✅ Đã lưu trữ trong Inbox.")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(
+                (q.message.text_html or "") + "\n\n✅ <b>Đã lưu trữ an toàn trong Inbox.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    if action == "sum":
+        await q.answer("📝 Đang tóm tắt file…")
+        req = "Hãy đọc kỹ và tóm tắt ngắn gọn, súc tích các nội dung/ý chính quan trọng nhất của file này."
+        badge = "📝 <b>Yêu cầu: Tóm tắt nội dung</b>"
+    else:
+        await q.answer("📊 Đang phân tích chi tiết…")
+        req = "Hãy đọc kỹ, phân tích chi tiết nội dung, số liệu, các điểm đáng chú ý hoặc rủi ro cần lưu tâm trong file này."
+        badge = "📊 <b>Yêu cầu: Phân tích chi tiết</b>"
+
+    with contextlib.suppress(Exception):
+        await q.edit_message_text(
+            (q.message.text_html or "") + f"\n\n{badge}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    prompt_txt = (
+        f"{_format_inbox_refs([target_path])}\n\n{req}\n"
+        f"(Đọc bằng `read_file` nếu là PDF/ảnh/audio/video/văn bản, hoặc dùng Python nếu là .docx/.xlsx/.zip)."
+    )
+    await s.enqueue_prompt(
+        [{"type": "text", "text": prompt_txt, "_inbox_files": [target_path]}],
+        immediate=True,
+    )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2481,28 +3880,46 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 BOT_COMMANDS = [
-    ("status", "Trạng thái"), ("file", "Tìm & tải file từ máy"), ("new", "Hội thoại mới"),
-    ("stop", "Huỷ tác vụ"), ("cd", "Đổi workspace"), ("projects", "Liệt kê dự án"),
-    ("sessions", "Phiên gần đây"), ("model", "Xem/đổi model"), ("mode", "Chế độ duyệt"),
-    ("auto", "Tự cho phép on/off"), ("restart", "Khởi động lại bot"),
-    ("goal", "Agent làm tới khi xong mục tiêu"), ("plan", "Lập kế hoạch trước"),
-    ("help", "Trợ giúp"),
+    ("pa", "Về Trợ lý cá nhân"),
+    ("todo", "Việc cần làm (To-Do)"),
+    ("note", "Sổ tay ghi chú nhanh"),
+    ("remind", "Nhắc việc & lịch định kỳ"),
+    ("file", "Tìm & tải file từ máy"),
+    ("status", "Trạng thái hệ thống"),
+    ("projects", "Liệt kê không gian & dự án"),
+    ("cd", "Chuyển sang dự án khác"),
+    ("sessions", "Phiên làm việc gần đây"),
+    ("new", "Tạo hội thoại mới"),
+    ("stop", "Dừng tác vụ đang chạy"),
+    ("model", "Xem/đổi model AI"),
+    ("mode", "Chế độ duyệt quyền"),
+    ("auto", "Tự động duyệt on/off"),
+    ("restart", "Khởi động lại bot"),
+    ("help", "Hướng dẫn sử dụng"),
 ]
 
 
 async def post_init(app: Application) -> None:
+    ensure_assistant_home()
     sync_antigravity_projects()
+    app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
     await app.bot.set_my_commands(BOT_COMMANDS)
     for uid in ALLOWED_USER_IDS:
         with contextlib.suppress(Exception):
             await app.bot.send_message(
                 uid,
-                "🟢 <b>Antigravity Bridge (<code>agy</code>) đã khởi động!</b>\nGõ <code>/help</code> để xem danh sách lệnh.",
+                "🟢 <b>Trợ Lý Cá Nhân Antigravity đã sẵn sàng!</b>\n"
+                "Gõ <code>/pa</code> để vào Trợ lý cá nhân hoặc <code>/help</code> để xem bảng lệnh.",
                 parse_mode=ParseMode.HTML,
             )
 
 
 async def post_shutdown(app: Application) -> None:
+    sched_task: asyncio.Task | None = app.bot_data.get("scheduler_task")
+    if sched_task and not sched_task.done():
+        sched_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sched_task
     for s in SESSIONS.values():
         await s.shutdown()
 
@@ -2514,8 +3931,11 @@ def main() -> None:
         raise SystemExit("Thiếu ALLOWED_USER_IDS trong .env (bắt buộc)")
     if not (os.path.isfile(AGY_PATH) and (os.name == "nt" or os.access(AGY_PATH, os.X_OK))):
         raise SystemExit(f"Không tìm thấy hoặc không thể thực thi agy tại: {AGY_PATH}")
+
+    Path(PROJECTS_ROOT).mkdir(parents=True, exist_ok=True)
+    ensure_assistant_home()
     if not os.path.isdir(DEFAULT_WORKSPACE):
-        raise SystemExit(f"DEFAULT_WORKSPACE không tồn tại: {DEFAULT_WORKSPACE}")
+        Path(DEFAULT_WORKSPACE).mkdir(parents=True, exist_ok=True)
 
     app = (
         ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
@@ -2523,6 +3943,10 @@ def main() -> None:
     )
     app.add_handler(CommandHandler(["start", "help"], start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler(["pa", "home", "assistant"], pa_cmd))
+    app.add_handler(CommandHandler(["todo", "todos", "viec"], todo_cmd))
+    app.add_handler(CommandHandler(["note", "notes", "ghichu"], note_cmd))
+    app.add_handler(CommandHandler(["remind", "lich", "reminders"], remind_cmd))
     app.add_handler(CommandHandler(["file", "files", "get", "find"], file_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
@@ -2536,12 +3960,21 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(permission_cb, pattern=r"^p:"))
     app.add_handler(CallbackQueryHandler(resume_cb, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(file_cb, pattern=r"^f:"))
+    app.add_handler(CallbackQueryHandler(todo_cb, pattern=r"^t:"))
+    app.add_handler(CallbackQueryHandler(schedule_cb, pattern=r"^s:"))
+    app.add_handler(CallbackQueryHandler(queue_cb, pattern=r"^q:"))
+    app.add_handler(CallbackQueryHandler(inbox_cb, pattern=r"^i:"))
     app.add_handler(MessageHandler(filters.PHOTO, photo_msg))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_msg))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO, doc_msg))
     # Văn bản thường + các lệnh lạ (/goal, /plan, /browser...) -> chuyển cho agent
     app.add_handler(MessageHandler(filters.TEXT, text_msg))
     app.add_error_handler(on_error)
 
-    log.info("🚀 Bridge đang chạy. agy=%s · whitelist=%s", AGY_PATH, sorted(ALLOWED_USER_IDS))
+    log.info(
+        "🚀 Bridge đang chạy. agy=%s · pa_home=%s · whitelist=%s",
+        AGY_PATH, ASSISTANT_HOME, sorted(ALLOWED_USER_IDS),
+    )
     app.run_polling(drop_pending_updates=True)
 
 
