@@ -14,6 +14,7 @@ Tài liệu này tổng hợp toàn bộ các lệnh điều khiển trên Teleg
 | `/projects` | `/projects` | Liệt kê tất cả các thư mục dự án con nằm trong `PROJECTS_ROOT`. |
 | `/cd` | `/cd TenDuAn`<br/>`/cd /duong/dan/tuyet/doi` | Chuyển sang thư mục dự án khác và bắt đầu phiên hội thoại mới tại đó. |
 | `/pwd` | `/pwd` | Xem nhanh đường dẫn thư mục dự án hiện tại. |
+| `/file` *(hoặc `/files`, `/get`, `/find`)* | `/file`<br/>`/file bao cao`<br/>`/file ~/Documents/plan.pdf` | Xem các file vừa làm việc gần đây, tìm nhanh file/thư mục trong `~/` (hỗ trợ tiếng Việt không dấu) kèm nút bấm tải về, hoặc gửi trực tiếp file/nén `.zip` thư mục (giới hạn upload Telegram Bot API: **50 MB**). File nhạy cảm (`.env`, `.ssh`, key...) sẽ hỏi xác nhận trước khi gửi. |
 | `/sessions` | `/sessions` | Lấy 10 phiên làm việc gần nhất (cả phiên tạo trên App máy tính lẫn trên Telegram). Bấm vào nút bên dưới tin nhắn để mở lại phiên đó. |
 | `/new` | `/new` | Đóng phiên hiện tại, tin nhắn kế tiếp sẽ mở một cuộc hội thoại hoàn toàn mới. |
 | `/stop` | `/stop` | Gửi tín hiệu huỷ (`session/cancel`) ngay lập tức nếu Agent đang chạy tác vụ quá lâu hoặc đi sai hướng. |

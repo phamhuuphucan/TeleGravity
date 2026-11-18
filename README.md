@@ -105,6 +105,7 @@ Toàn bộ quy trình từ thiết lập trên máy cá nhân, đồng bộ phi�
 | `/sessions` | Liệt kê 10 phiên gần nhất (cả trên App & Telegram) → bấm nút để mở lại |
 | `/projects` | Liệt kê danh sách các dự án trong `PROJECTS_ROOT` |
 | `/cd <TênDựÁn \| ĐườngDẫn>` | Chuyển nhanh sang dự án khác (ví dụ: `/cd WebApp`) |
+| `/file [TừKhoá \| ĐườngDẫn]` | Tìm kiếm & tải file/thư mục trên máy (`~/`) về Telegram (tối đa 50 MB) |
 | `/new` | Bắt đầu phiên hội thoại mới trên workspace hiện tại |
 | `/stop` | Dừng ngay lập tức tác vụ Agent đang thực thi |
 | `/model [id]` | Xem danh sách model khả dụng hoặc đổi model (Gemini, Claude...) |
